@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local runtime state, logs, tokens, and saved account credentials.
+data/
+
+# Local assistant/editor state.
+.agents/
+.codex/
+.claude/
+.git-local/
+
+# Environment and OS/editor noise.
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db
