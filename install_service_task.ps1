@@ -6,22 +6,31 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RuntimePs = Join-Path $Root "bridge_runtime.ps1"
+$HiddenLauncher = Join-Path $Root "run_hidden.vbs"
 
 if (-not (Test-Path -LiteralPath $RuntimePs)) {
     throw "Missing bridge_runtime.ps1 at $RuntimePs"
 }
 
+if (-not (Test-Path -LiteralPath $HiddenLauncher)) {
+    throw "Missing hidden launcher at $HiddenLauncher"
+}
+
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).
     IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $PowerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$WScriptExe = Join-Path $env:SystemRoot "System32\wscript.exe"
 
 if (-not (Test-Path -LiteralPath $PowerShellExe)) {
     throw "Missing Windows PowerShell at $PowerShellExe"
 }
+if (-not (Test-Path -LiteralPath $WScriptExe)) {
+    throw "Missing Windows Script Host at $WScriptExe"
+}
 
 $Action = New-ScheduledTaskAction `
-    -Execute $PowerShellExe `
-    -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Mode service' -f $RuntimePs) `
+    -Execute $WScriptExe `
+    -Argument ('//B //NoLogo "{0}"' -f $HiddenLauncher) `
     -WorkingDirectory $Root
 
 $Settings = New-ScheduledTaskSettingsSet `

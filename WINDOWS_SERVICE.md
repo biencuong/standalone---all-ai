@@ -1,12 +1,15 @@
 # Windows Auto-Start
 
 This app can auto-start with Windows by registering a hidden Scheduled Task.
+The task uses `wscript.exe` plus `run_hidden.vbs`, so Windows logon/startup
+does not show a black `cmd.exe` or PowerShell console window.
 
 ## Files
 
 - `install_service.bat`: install auto-start and start the bridge now
 - `remove_service.bat`: stop the bridge and remove auto-start
 - `bridge_runtime.ps1`: shared runtime used by manual run and background task
+- `run_hidden.vbs`: hidden Windows Script Host launcher used by the startup task
 
 ## Behavior
 
@@ -14,8 +17,10 @@ This app can auto-start with Windows by registering a hidden Scheduled Task.
   - creates a boot-time task
   - runs as `SYSTEM`
   - starts with Windows before user logon
+  - recommended when you want service-like startup with Windows boot
 - Run `install_service.bat` without Administrator:
   - falls back to current-user auto-start at logon
+  - still uses a hidden launcher, so it should not show a black cmd window
 
 ## Python requirement
 

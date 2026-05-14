@@ -158,15 +158,16 @@ try {
             if (-not (Test-Path -LiteralPath $DataDir)) {
                 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
             }
-            $cmdExe = Join-Path $env:SystemRoot "System32\cmd.exe"
-            if (-not (Test-Path -LiteralPath $cmdExe)) {
-                throw "Missing Windows cmd.exe at $cmdExe"
-            }
-            $quotedArgs = @($launch.Arguments | ForEach-Object { Quote-CmdArgument $_ })
-            $pythonParts = @((Quote-CmdArgument $launch.FilePath)) + $quotedArgs
-            $pythonCommand = ($pythonParts -join " ")
-            $serviceCommand = "$pythonCommand 1>> $(Quote-CmdArgument $OutLog) 2>> $(Quote-CmdArgument $ErrLog)"
-            & $cmdExe /d /c $serviceCommand
+
+            $argumentString = (($launch.Arguments | ForEach-Object { Quote-CmdArgument $_ }) -join " ")
+            Start-Process `
+                -FilePath $launch.FilePath `
+                -ArgumentList $argumentString `
+                -WorkingDirectory $Root `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput $OutLog `
+                -RedirectStandardError $ErrLog | Out-Null
+            exit 0
         } else {
             & $launch.FilePath @($launch.Arguments)
         }
