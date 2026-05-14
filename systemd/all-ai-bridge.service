@@ -1,0 +1,15 @@
+[Unit]
+Description=Multi-Provider OAuth Bridge
+
+[Service]
+Type=simple
+WorkingDirectory=/home/adti/AI/Proxy/standalone - all-ai
+Environment=BRIDGE_HOST=127.0.0.1
+Environment=BRIDGE_PORT=12345
+Environment=PYTHON=.venv/bin/python
+ExecStart=/usr/bin/env bash run.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

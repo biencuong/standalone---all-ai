@@ -1,0 +1,5 @@
+fastapi>=0.118.0
+uvicorn>=0.30.0
+httpx[http2]>=0.27.0
+python-multipart>=0.0.9
+starlette>=0.40,<1.1

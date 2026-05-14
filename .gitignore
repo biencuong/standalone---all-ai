@@ -1,9 +1,12 @@
-.venv/
-__pycache__/
-*.py[cod]
-
 # Local runtime state, logs, tokens, and saved account credentials.
 data/
+
+# Python environments and generated files.
+.venv/
+.venv-win/
+venv/
+__pycache__/
+*.py[cod]
 
 # Local assistant/editor state.
 .agents/
@@ -15,5 +18,7 @@ data/
 .env
 .env.*
 *.log
+*.pid
+*.tmp
 .DS_Store
 Thumbs.db
