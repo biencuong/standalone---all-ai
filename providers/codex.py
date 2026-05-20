@@ -69,12 +69,21 @@ REASONING_EFFORT_ORDER = ["low", "medium", "high", "xhigh"]
 REASONING_EFFORT_LABELS = {
     "low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra High",
 }
+GPT_5_5_CONTEXT_TOKENS = 1_000_000
 
 CODEX_MODEL_CATALOG: List[Dict[str, Any]] = [
     {"id": "gpt-5.5", "name": "GPT-5.5",
-     "description": "Frontier model for complex coding, research, and real-world work.",
+     "description": "Frontier model for complex coding, research, and real-world work. Context up to 1M tokens.",
      "supports_multimodal": True, "supports_image": True,
-     "default_reasoning_effort": "medium", "default_verbosity": "medium"},
+     "supports_reasoning": True,
+     "context_window": GPT_5_5_CONTEXT_TOKENS,
+     "context_length": GPT_5_5_CONTEXT_TOKENS,
+     "max_context_tokens": GPT_5_5_CONTEXT_TOKENS,
+     "max_input_tokens": GPT_5_5_CONTEXT_TOKENS,
+     "default_reasoning_effort": "medium",
+     "supported_reasoning_efforts": REASONING_EFFORT_ORDER,
+     "reasoning_levels": REASONING_EFFORT_ORDER,
+     "default_verbosity": "medium"},
     {"id": "gpt-5.4", "name": "GPT-5.4",
      "description": "Strong model for everyday coding.",
      "supports_multimodal": True, "supports_image": True,
@@ -110,9 +119,14 @@ def _build_variants(base_id: str) -> List[Dict[str, Any]]:
     return variants
 
 
-CODEX_MODEL_VARIANTS = _build_variants("gpt-5.5")
+CODEX_REASONING_VARIANT_BASE_IDS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
+CODEX_MODEL_VARIANTS = [
+    variant
+    for base_id in CODEX_REASONING_VARIANT_BASE_IDS
+    for variant in _build_variants(base_id)
+]
 ALL_CODEX_MODELS = CODEX_MODEL_CATALOG + CODEX_MODEL_VARIANTS
-EXPOSED_MODELS = CODEX_MODEL_VARIANTS + [m for m in CODEX_MODEL_CATALOG if m["id"] != "gpt-5.5"]
+EXPOSED_MODELS = CODEX_MODEL_CATALOG + CODEX_MODEL_VARIANTS
 CODEX_MODEL_IDS = {m["id"] for m in ALL_CODEX_MODELS}
 
 MODEL_ALIASES: Dict[str, str] = {
@@ -170,18 +184,31 @@ def build_models_list() -> List[Dict[str, Any]]:
     created = int(time.time())
     out = []
     for m in EXPOSED_MODELS:
-        out.append({
+        supported_reasoning = list(m.get("supported_reasoning_efforts") or REASONING_EFFORT_ORDER)
+        item = {
             "id": m["id"], "object": "model", "created": created, "owned_by": "openai",
             "name": m["name"], "description": m["description"],
             "supports_multimodal": bool(m.get("supports_multimodal")),
             "supports_image": bool(m.get("supports_image")),
+            "supports_reasoning": bool(m.get("supports_reasoning", True)),
             "canonical_model": m.get("canonical_model", m["id"]),
             "default_reasoning_effort": m.get("default_reasoning_effort"),
-            "supported_reasoning_efforts": sorted(SUPPORTED_REASONING_EFFORTS),
+            "supported_reasoning_efforts": supported_reasoning,
+            "reasoning_levels": list(m.get("reasoning_levels") or supported_reasoning),
             "default_verbosity": m.get("default_verbosity"),
-            "supported_verbosity": sorted(SUPPORTED_VERBOSITY_LEVELS),
+            "supported_verbosity": ["low", "medium", "high"],
             "provider": PROVIDER,
-        })
+        }
+        for key in (
+            "context_window",
+            "context_length",
+            "max_context_tokens",
+            "max_input_tokens",
+            "max_output_tokens",
+        ):
+            if key in m:
+                item[key] = m[key]
+        out.append(item)
     return out
 
 
@@ -260,6 +287,31 @@ class CodexTokenStore:
             data.update(new)
             self.save(data)
             return data["access_token"]
+
+    async def refresh_if_needed(
+        self,
+        min_valid_seconds: int = REFRESH_SAFETY_WINDOW,
+        *,
+        force: bool = False,
+    ) -> bool:
+        async with self._lock:
+            data = self.load()
+            token = data.get("access_token")
+            expires_at = float(data.get("expires_at") or 0)
+            refresh = data.get("refresh_token")
+            now = time.time()
+            if not refresh:
+                if force or not token:
+                    raise AuthRevoked("No refresh token")
+                return False
+            if not force and token and expires_at > now + max(0, int(min_valid_seconds)):
+                return False
+            new = await self._refresh(refresh)
+            for key, value in new.items():
+                if value not in ("", 0, 0.0, None) or key in {"access_token", "expires_at"}:
+                    data[key] = value
+            self.save(data)
+            return True
 
     async def _refresh(self, refresh_token: str) -> Dict[str, Any]:
         client = await get_http_client()

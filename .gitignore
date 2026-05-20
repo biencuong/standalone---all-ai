@@ -4,9 +4,15 @@ data/
 # Python environments and generated files.
 .venv/
 .venv-win/
+.venv-build/
 venv/
 __pycache__/
 *.py[cod]
+
+# Build artifacts.
+build/
+dist/
+release/
 
 # Local assistant/editor state.
 .agents/

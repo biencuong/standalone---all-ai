@@ -88,6 +88,19 @@ class AccountHealth:
             return False
         return True
 
+    def active_rate_limit(self, now: Optional[float] = None) -> Dict[str, Any]:
+        if not self.rate_limit:
+            return {}
+        current = now or time.time()
+        try:
+            updated_at = float(self.rate_limit.get("updated_at") or 0)
+            retry_after = float(self.rate_limit.get("retry_after_seconds") or 0)
+        except (TypeError, ValueError):
+            return {}
+        if updated_at and retry_after and updated_at + retry_after > current:
+            return self.rate_limit
+        return {}
+
 
 @dataclass
 class AccountMeta:
@@ -179,7 +192,7 @@ class Account:
                 "last_used_at": self.health.last_used_at,
                 "last_success_at": self.health.last_success_at,
                 "last_429_reason": self.health.last_429_reason,
-                "rate_limit": self.health.rate_limit,
+                "rate_limit": self.health.active_rate_limit(now),
             },
         }
 
@@ -276,6 +289,8 @@ class AccountPool:
             rl = h.get("rate_limit")
             if isinstance(rl, dict):
                 acc.health.rate_limit = rl
+                if not acc.health.active_rate_limit(now):
+                    acc.health.rate_limit = {}
 
     def _persist_health(self) -> None:
         try:
@@ -395,32 +410,42 @@ class AccountPool:
 
     # -- selection ----------------------------------------------------------
 
-    def healthy(self, provider: str) -> List[Account]:
+    def available(self, provider: str) -> List[Account]:
         now = time.time()
         return [
             a for a in self._accounts
             if (
                 a.provider == provider
                 and a.meta.enabled
-                and a.meta.rotation_enabled
                 and a.health.is_healthy(now)
             )
         ]
+
+    def healthy(self, provider: str) -> List[Account]:
+        # Backward-compatible name: health/enablement decides whether a slot
+        # can run. Rotation is only a selection preference in acquire().
+        return self.available(provider)
 
     async def acquire(
         self, provider: str, strategy: Optional[str] = None
     ) -> Optional[Account]:
         strategy = strategy or SETTINGS.pool_strategy
         async with self._lock:
-            candidates = self.healthy(provider)
+            candidates = self.available(provider)
             if not candidates:
                 return None
 
             if strategy == "round_robin":
+                rotating = [a for a in candidates if a.meta.rotation_enabled]
+                if rotating:
+                    candidates = rotating
                 idx = self._round_robin_idx.get(provider, 0) % len(candidates)
                 self._round_robin_idx[provider] = idx + 1
                 acc = candidates[idx]
             elif strategy == "random":
+                rotating = [a for a in candidates if a.meta.rotation_enabled]
+                if rotating:
+                    candidates = rotating
                 acc = random.choice(candidates)
             else:  # least_load
                 acc = min(
@@ -442,6 +467,8 @@ class AccountPool:
                     account.health.exhausted_until = 0
                     account.health.last_429_reason = ""
                     account.health.last_429_at = 0
+                if not account.health.active_rate_limit(now):
+                    account.health.rate_limit = {}
             else:
                 account.health.consecutive_failures += 1
             self._persist_health()

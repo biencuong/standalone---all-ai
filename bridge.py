@@ -13,6 +13,8 @@ Routes:
 - GET  /health                        liveness
 - GET  /v1/models                     aggregated model list
 - POST /v1/chat/completions           with failover across pool
+- POST /v1/messages                   Anthropic-compatible shim for Claude Code
+- POST /v1/messages/count_tokens      approximate Anthropic token count
 - POST /v1/audio/transcriptions       Whisper-compatible (Codex backend)
 - GET/POST /v1/oauth/token            return live bearer (per slot or first)
 - GET  /.well-known/openai-bridge     discovery
@@ -20,12 +22,13 @@ Routes:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import random
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Header, Request, UploadFile
@@ -33,6 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from accounts import POOL, migrate_legacy_data, resolve_provider
+from auth_keys import API_KEYS, ManagedKeyAuth
 from core import (
     AuthRevoked,
     CALLBACK_BROKER,
@@ -90,6 +94,19 @@ PROVIDER_EXECUTORS = {
 GROUP_MODES = {"priority", "round_robin", "random"}
 ROUTE_GROUPS: Dict[str, Dict[str, Any]] = {}
 _ROUTE_GROUP_RR: Dict[str, int] = {}
+CLAUDE_CODE_MODEL_ROUTES = {
+    "claude-opus-4-7": "gpt-5.5-xhigh",
+    "claude-opus": "gpt-5.5-xhigh",
+    "claude-opus-latest": "gpt-5.5-xhigh",
+    "claude-sonnet-4-6": "gpt-5.5-high",
+    "claude-sonnet": "gpt-5.5-high",
+    "claude-sonnet-latest": "gpt-5.5-high",
+    "claude-haiku-4-5": "gpt-5.5-low",
+    "claude-haiku-4-5-20251001": "gpt-5.5-low",
+    "claude-haiku": "gpt-5.5-low",
+    "claude-haiku-latest": "gpt-5.5-low",
+}
+CLAUDE_CODE_LOCAL_ROUTE_GROUPS = ("claude-local", "claude-3-5-sonnet-latest")
 
 
 def _provider_default_model(provider: str) -> str:
@@ -309,6 +326,52 @@ def _attempt_from_item(item: Dict[str, str]) -> Optional[Dict[str, str]]:
     }
 
 
+def _group_route_plan(name: str, *, kind: str = "group", display_name: Optional[str] = None) -> Dict[str, Any]:
+    attempts = [
+        attempt
+        for item in _ordered_group_items(name)
+        for attempt in [_attempt_from_item(item)]
+        if attempt is not None
+    ]
+    providers = []
+    for attempt in attempts:
+        provider = attempt["provider"]
+        if provider not in providers:
+            providers.append(provider)
+    return {
+        "name": display_name or name,
+        "kind": kind,
+        "providers": providers,
+        "attempts": attempts,
+    }
+
+
+def _claude_code_model_route(key: str) -> Optional[Dict[str, Any]]:
+    mapped_model = CLAUDE_CODE_MODEL_ROUTES.get(key)
+    if not mapped_model:
+        return None
+    return {
+        "name": key,
+        "kind": "claude_code_alias",
+        "providers": ["chatgpt"],
+        "attempts": [{
+            "provider": "chatgpt",
+            "model": mapped_model,
+            "label": f"claude-alias/{key}->{mapped_model}",
+            "kind": "model",
+        }],
+    }
+
+
+def _claude_code_local_alias(key: str) -> str:
+    if key not in CLAUDE_CODE_MODEL_ROUTES:
+        return ""
+    for group in CLAUDE_CODE_LOCAL_ROUTE_GROUPS:
+        if group in ROUTE_GROUPS:
+            return group
+    return ""
+
+
 def _resolve_route_plan(req: Dict[str, Any]) -> Dict[str, Any]:
     model = str(req.get("model") or "").strip()
     key = _normalize_group_name(model)
@@ -323,23 +386,15 @@ def _resolve_route_plan(req: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if key in ROUTE_GROUPS:
-        attempts = [
-            attempt
-            for item in _ordered_group_items(key)
-            for attempt in [_attempt_from_item(item)]
-            if attempt is not None
-        ]
-        providers = []
-        for attempt in attempts:
-            provider = attempt["provider"]
-            if provider not in providers:
-                providers.append(provider)
-        return {
-            "name": key,
-            "kind": "group",
-            "providers": providers,
-            "attempts": attempts,
-        }
+        return _group_route_plan(key)
+
+    claude_code_route = _claude_code_model_route(key)
+    if claude_code_route:
+        return claude_code_route
+
+    local_alias = _claude_code_local_alias(key)
+    if local_alias:
+        return _group_route_plan(local_alias, kind="claude_code_alias", display_name=key)
 
     provider = resolve_provider(model)
     attempts: List[Dict[str, str]] = [
@@ -388,6 +443,43 @@ def _should_failover_client_error(plan: Dict[str, Any], err: UpstreamClientError
     return len(plan.get("attempts") or []) > 1 and _looks_like_model_error(err)
 
 
+def _refresh_safety_seconds(provider: str) -> int:
+    if provider == "google":
+        return SETTINGS.google_refresh_safety_seconds
+    if provider == "chatgpt":
+        return SETTINGS.codex_refresh_safety_seconds
+    return 0
+
+
+async def _refresh_saved_tokens_once() -> None:
+    for acc in POOL.all_accounts():
+        if not acc.enabled:
+            continue
+        refresh_if_needed = getattr(acc.token_store, "refresh_if_needed", None)
+        if not callable(refresh_if_needed):
+            continue
+        safety_seconds = _refresh_safety_seconds(acc.provider)
+        if safety_seconds <= 0:
+            continue
+        try:
+            refreshed = await refresh_if_needed(min_valid_seconds=safety_seconds)
+            if refreshed:
+                await POOL.mark_valid(acc)
+                logger.info("Refreshed OAuth token for %s (%s)", acc.slot_id, acc.provider)
+        except AuthRevoked as exc:
+            await POOL.mark_invalid(acc)
+            logger.warning("OAuth refresh revoked for %s: %s", acc.slot_id, exc)
+        except Exception as exc:
+            logger.warning("OAuth auto-refresh failed for %s (%s): %s", acc.slot_id, acc.provider, exc)
+
+
+async def _token_refresh_loop() -> None:
+    interval = max(60, int(SETTINGS.oauth_refresh_interval_seconds or 300))
+    while True:
+        await _refresh_saved_tokens_once()
+        await asyncio.sleep(interval)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -413,6 +505,9 @@ async def lifespan(app: FastAPI):
         logger.exception("Failed to import DeepSeek API key")
     CALLBACK_BROKER.set_loop(asyncio.get_running_loop())
     await get_http_client()
+    refresh_task: Optional[asyncio.Task] = None
+    if SETTINGS.oauth_auto_refresh and SETTINGS.oauth_refresh_interval_seconds > 0:
+        refresh_task = asyncio.create_task(_token_refresh_loop(), name="oauth-refresh-loop")
     logger.info(
         "Bridge ready: %d accounts across providers %s",
         len(POOL.all_accounts()),
@@ -422,6 +517,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # Shutdown
+        if refresh_task:
+            refresh_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await refresh_task
         CALLBACK_BROKER.shutdown()
         await close_http_client()
         logger.info("Bridge stopped")
@@ -443,14 +542,245 @@ if SETTINGS.enable_cors:
 # ---------------------------------------------------------------------------
 
 
-def _check_bridge_auth(authorization: Optional[str]) -> None:
+def _extract_auth_token(authorization: Optional[str], x_api_key: Optional[str] = None) -> str:
+    tokens = _extract_auth_tokens(authorization, x_api_key)
+    return tokens[0] if tokens else ""
+
+
+def _extract_auth_tokens(authorization: Optional[str], x_api_key: Optional[str] = None) -> List[str]:
+    tokens: List[str] = []
+    if authorization:
+        token = authorization.removeprefix("Bearer ").strip()
+        if token:
+            tokens.append(token)
+    if x_api_key:
+        token = x_api_key.strip()
+        if token:
+            tokens.append(token)
+    out: List[str] = []
+    seen = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _check_bridge_auth(authorization: Optional[str], x_api_key: Optional[str] = None) -> None:
     if not SETTINGS.api_key:
         return
-    if not authorization:
+    tokens = _extract_auth_tokens(authorization, x_api_key)
+    if not tokens:
         raise HTTPException(401, "Missing bridge API key")
-    token = authorization.removeprefix("Bearer ").strip()
-    if token != SETTINGS.api_key:
+    if SETTINGS.api_key not in tokens:
         raise HTTPException(401, "Invalid bridge API key")
+
+
+def _request_client_ip(request: Request) -> str:
+    if SETTINGS.trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for") or ""
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+        real_ip = request.headers.get("x-real-ip") or ""
+        if real_ip:
+            return real_ip.strip()
+    return request.client.host if request.client else ""
+
+
+def _all_models_payload() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    created = int(time.time())
+    for prov, execs in PROVIDER_EXECUTORS.items():
+        if POOL.by_provider(prov):
+            for model in execs["models"]():
+                item = dict(model)
+                item["provider"] = item.get("provider") or prov
+                out.append(item)
+            out.append({
+                "id": prov,
+                "object": "model",
+                "created": created,
+                "owned_by": "bridge",
+                "name": f"{execs['label']} rotation",
+                "description": "Provider alias: route to this provider and rotate enabled accounts.",
+                "provider": prov,
+                "route_kind": "provider",
+            })
+    for group in _route_groups_payload():
+        out.append({
+            "id": group["name"],
+            "object": "model",
+            "created": created,
+            "owned_by": "bridge",
+            "name": f"Route group: {group['name']}",
+            "description": "Custom model/provider rotation group.",
+            "provider": "bridge",
+            "route_kind": "group",
+            "mode": group["mode"],
+            "items": group["items"],
+        })
+    return out
+
+
+def _usage_total_tokens(usage: Any) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    try:
+        total = int(usage.get("total_tokens") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total > 0:
+        return total
+    try:
+        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, prompt + completion)
+
+
+def _allowed_model_tokens(requested_model: str) -> set[str]:
+    key = _normalize_group_name(requested_model)
+    tokens = {requested_model.strip().lower(), key}
+    for item in _provider_models():
+        if str(item.get("id") or "").strip().lower() == key:
+            canonical = str(item.get("canonical_model") or "").strip().lower()
+            if canonical:
+                tokens.add(canonical)
+            provider = str(item.get("provider") or "").strip().lower()
+            if provider:
+                tokens.add(provider)
+            break
+    try:
+        plan = _resolve_route_plan({"model": requested_model})
+    except Exception:
+        return {t for t in tokens if t}
+    if plan.get("name"):
+        tokens.add(str(plan["name"]).lower())
+    for provider in plan.get("providers") or []:
+        tokens.add(str(provider).lower())
+    for attempt in plan.get("attempts") or []:
+        if attempt.get("model"):
+            tokens.add(str(attempt["model"]).lower())
+        if attempt.get("provider"):
+            tokens.add(str(attempt["provider"]).lower())
+    return {t for t in tokens if t}
+
+
+def _managed_key_allows_model(auth: ManagedKeyAuth, requested_model: str) -> bool:
+    allowed = {str(x).strip().lower() for x in auth.allowed_models if str(x).strip()}
+    if "*" in allowed:
+        return True
+    key = _normalize_group_name(requested_model)
+    if key in allowed or requested_model.strip().lower() in allowed:
+        return True
+    try:
+        plan = _resolve_route_plan({"model": requested_model})
+    except Exception:
+        return bool(allowed.intersection(_allowed_model_tokens(requested_model)))
+    if str(plan.get("name") or "").lower() in allowed:
+        return True
+    providers = {str(p).lower() for p in plan.get("providers") or [] if p}
+    if providers and providers.issubset(allowed):
+        return True
+    if key in ROUTE_GROUPS:
+        return False
+    model_tokens = _allowed_model_tokens(requested_model) - providers
+    return bool(allowed.intersection(model_tokens))
+
+
+def _authorize_v1(
+    request: Request,
+    authorization: Optional[str] = None,
+    x_api_key: Optional[str] = None,
+    *,
+    model: Optional[str] = None,
+) -> Optional[ManagedKeyAuth]:
+    tokens = _extract_auth_tokens(authorization, x_api_key)
+    if SETTINGS.api_key and SETTINGS.api_key in tokens:
+        return None
+    if not tokens:
+        if SETTINGS.api_key:
+            raise HTTPException(401, "Missing API key")
+        return None
+    record = None
+    for token in tokens:
+        record = API_KEYS.authenticate(token)
+        if record:
+            break
+    if not record:
+        raise HTTPException(401, "Invalid API key")
+    client_ip = _request_client_ip(request)
+    ok, reason = API_KEYS.check_usable(record, client_ip)
+    if not ok:
+        code = 429 if reason == "exhausted" else 403
+        if reason == "expired":
+            code = 401
+        raise HTTPException(code, f"API key denied: {reason}")
+    auth = ManagedKeyAuth(
+        key_id=str(record.get("id") or ""),
+        name=str(record.get("name") or ""),
+        prefix=str(record.get("prefix") or ""),
+        allowed_models=[str(x) for x in record.get("allowed_models") or []],
+        token_limit=int(record.get("token_limit") or 0),
+        token_used=int(record.get("token_used") or 0),
+        network_scope=str(record.get("network_scope") or "local"),
+        client_ip=client_ip,
+    )
+    if model and not _managed_key_allows_model(auth, model):
+        API_KEYS.record_usage(auth.key_id, 0, client_ip, error=f"model_denied:{model}")
+        raise HTTPException(403, f"API key is not allowed to use model {model}")
+    return auth
+
+
+def _filter_models_for_key(models: List[Dict[str, Any]], auth: Optional[ManagedKeyAuth]) -> List[Dict[str, Any]]:
+    if auth is None:
+        return models
+    return [
+        item for item in models
+        if _managed_key_allows_model(auth, str(item.get("id") or ""))
+    ]
+
+
+def _record_managed_usage(auth: Optional[ManagedKeyAuth], tokens: int, error: str = "") -> None:
+    if auth is None:
+        return
+    API_KEYS.record_usage(auth.key_id, tokens, auth.client_ip, error=error)
+
+
+def _chat_body_with_internal_usage(body: Dict[str, Any], auth: Optional[ManagedKeyAuth]) -> Tuple[Dict[str, Any], bool]:
+    if auth is None:
+        return body, bool((body.get("stream_options") or {}).get("include_usage"))
+    client_wants_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+    if not auth.token_limit and client_wants_usage:
+        return body, True
+    patched = copy.deepcopy(body)
+    opts = patched.get("stream_options")
+    if not isinstance(opts, dict):
+        opts = {}
+    opts["include_usage"] = True
+    patched["stream_options"] = opts
+    return patched, client_wants_usage
+
+
+async def _meter_openai_stream(
+    stream: AsyncGenerator[bytes, None],
+    auth: Optional[ManagedKeyAuth],
+    *,
+    expose_usage: bool,
+) -> AsyncGenerator[bytes, None]:
+    total_tokens = 0
+    async for chunk in stream:
+        hide_chunk = False
+        for payload in _iter_openai_sse_payloads(chunk):
+            if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
+                total_tokens = max(total_tokens, _usage_total_tokens(payload.get("usage")))
+                if not expose_usage and payload.get("choices") == []:
+                    hide_chunk = True
+        if not hide_chunk:
+            yield chunk
+    _record_managed_usage(auth, total_tokens, "" if total_tokens else "missing_usage")
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +995,508 @@ def _no_account_message(plan: Dict[str, Any], tried: List[str], last: Optional[E
 
 
 # ---------------------------------------------------------------------------
-# Routes — /v1
+# Anthropic Messages compatibility shim
+# ---------------------------------------------------------------------------
+
+
+def _anthropic_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                typ = item.get("type")
+                if typ in ("text", "input_text", "output_text"):
+                    parts.append(str(item.get("text") or ""))
+                elif typ == "tool_result":
+                    parts.append(_anthropic_text(item.get("content")))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _anthropic_source_url(source: Any) -> str:
+    if not isinstance(source, dict):
+        return ""
+    if source.get("type") == "url":
+        return str(source.get("url") or "")
+    if source.get("type") == "base64":
+        media_type = str(source.get("media_type") or "application/octet-stream")
+        data = str(source.get("data") or "")
+        return f"data:{media_type};base64,{data}" if data else ""
+    return str(source.get("url") or source.get("uri") or source.get("path") or "")
+
+
+def _anthropic_content_to_openai(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+
+    out: List[Dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                out.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        typ = item.get("type")
+        if typ in ("text", "input_text", "output_text"):
+            text = item.get("text") or ""
+            if text:
+                out.append({"type": "text", "text": text})
+        elif typ == "image":
+            url = _anthropic_source_url(item.get("source"))
+            if url:
+                out.append({"type": "image_url", "image_url": {"url": url}})
+        elif typ in ("document", "pdf"):
+            url = _anthropic_source_url(item.get("source"))
+            if not url:
+                continue
+            file_obj: Dict[str, Any] = {
+                "filename": item.get("name") or item.get("filename") or "document"
+            }
+            if url.startswith("data:"):
+                file_obj["file_data"] = url
+            else:
+                file_obj["file_url"] = url
+            out.append({"type": "file", "file": file_obj})
+    if not out:
+        return ""
+    if len(out) == 1 and out[0].get("type") == "text":
+        return out[0].get("text") or ""
+    return out
+
+
+def _split_anthropic_user_content(content: Any) -> Tuple[Any, List[Dict[str, Any]]]:
+    if not isinstance(content, list):
+        return content, []
+    regular: List[Any] = []
+    tool_results: List[Dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "tool_result":
+            tool_results.append(item)
+        else:
+            regular.append(item)
+    return regular, tool_results
+
+
+def _anthropic_system_to_text(system: Any) -> str:
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        return _anthropic_text(system)
+    return ""
+
+
+def _anthropic_tool_args(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value or {}, ensure_ascii=False)
+    except Exception:
+        return "{}"
+
+
+def _anthropic_messages_to_openai(body: Dict[str, Any]) -> List[Dict[str, Any]]:
+    messages: List[Dict[str, Any]] = []
+    system_text = _anthropic_system_to_text(body.get("system"))
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+
+    for raw_msg in body.get("messages") or []:
+        if not isinstance(raw_msg, dict):
+            continue
+        role = str(raw_msg.get("role") or "user").lower()
+        content = raw_msg.get("content")
+        if role == "assistant":
+            tool_calls: List[Dict[str, Any]] = []
+            text_blocks: List[str] = []
+            blocks = content if isinstance(content, list) else [
+                {"type": "text", "text": _anthropic_text(content)}
+            ]
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                typ = block.get("type")
+                if typ == "tool_use":
+                    tool_calls.append({
+                        "id": block.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name") or "",
+                            "arguments": _anthropic_tool_args(block.get("input")),
+                        },
+                    })
+                elif typ in ("text", "input_text", "output_text"):
+                    text = block.get("text") or ""
+                    if text:
+                        text_blocks.append(text)
+            msg: Dict[str, Any] = {"role": "assistant", "content": "\n".join(text_blocks)}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            messages.append(msg)
+            continue
+
+        regular_content, tool_results = _split_anthropic_user_content(content)
+        converted = _anthropic_content_to_openai(regular_content)
+        if converted:
+            messages.append({"role": "user", "content": converted})
+        for result in tool_results:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": result.get("tool_use_id") or result.get("id") or "",
+                "content": _anthropic_text(result.get("content")),
+            })
+
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+    return messages
+
+
+def _anthropic_tools_to_openai(tools: Any) -> List[Dict[str, Any]]:
+    if not isinstance(tools, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not name:
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description") or "",
+                "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        })
+    return out
+
+
+def _anthropic_tool_choice_to_openai(choice: Any) -> Any:
+    if not isinstance(choice, dict):
+        return choice
+    typ = choice.get("type")
+    if typ == "auto":
+        return "auto"
+    if typ == "any":
+        return "required"
+    if typ == "none":
+        return "none"
+    if typ == "tool" and choice.get("name"):
+        return {"type": "function", "function": {"name": choice["name"]}}
+    return None
+
+
+def _anthropic_request_to_openai_chat(body: Dict[str, Any]) -> Dict[str, Any]:
+    original_model = body.get("model") or SETTINGS.anthropic_default_model
+    req: Dict[str, Any] = {
+        "model": original_model,
+        "_anthropic_model": original_model,
+        "messages": _anthropic_messages_to_openai(body),
+        "stream": bool(body.get("stream")),
+    }
+    if body.get("max_tokens") is not None:
+        req["max_tokens"] = body["max_tokens"]
+    for key in ("temperature", "top_p", "top_k"):
+        if body.get(key) is not None:
+            req[key] = body[key]
+    if body.get("stop_sequences") is not None:
+        req["stop"] = body["stop_sequences"]
+    tools = _anthropic_tools_to_openai(body.get("tools"))
+    if tools:
+        req["tools"] = tools
+    tool_choice = _anthropic_tool_choice_to_openai(body.get("tool_choice"))
+    if tool_choice is not None:
+        req["tool_choice"] = tool_choice
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = int(thinking.get("budget_tokens") or 4096)
+        req["reasoning_effort"] = (
+            "xhigh" if budget >= 32768 else "high" if budget >= 16384 else "medium"
+        )
+    return req
+
+
+def _parse_tool_input(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
+    except Exception:
+        return {"_raw": str(raw)}
+
+
+def _openai_usage_to_anthropic(usage: Any) -> Dict[str, int]:
+    if not isinstance(usage, dict):
+        return {"input_tokens": 0, "output_tokens": 0}
+    return {
+        "input_tokens": int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
+    }
+
+
+def _openai_finish_to_anthropic(reason: Any) -> str:
+    value = str(reason or "").lower()
+    if value in ("length", "max_tokens"):
+        return "max_tokens"
+    if value in ("tool_calls", "function_call"):
+        return "tool_use"
+    if value == "stop_sequence":
+        return "stop_sequence"
+    return "end_turn"
+
+
+def _openai_completion_to_anthropic(req: Dict[str, Any], completion: Dict[str, Any]) -> Dict[str, Any]:
+    choices = completion.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    content: List[Dict[str, Any]] = []
+    reasoning = message.get("reasoning_content")
+    if reasoning:
+        content.append({"type": "thinking", "thinking": str(reasoning)})
+    text = message.get("content")
+    if text:
+        content.append({"type": "text", "text": str(text)})
+    for tc in message.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        content.append({
+            "type": "tool_use",
+            "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+            "name": fn.get("name") or "",
+            "input": _parse_tool_input(fn.get("arguments")),
+        })
+    if not content:
+        content.append({"type": "text", "text": ""})
+    return {
+        "id": f"msg_{uuid.uuid4().hex}",
+        "type": "message",
+        "role": "assistant",
+        "model": req.get("_anthropic_model") or completion.get("model") or req.get("model") or "",
+        "content": content,
+        "stop_reason": _openai_finish_to_anthropic(choice.get("finish_reason")),
+        "stop_sequence": None,
+        "usage": _openai_usage_to_anthropic(completion.get("usage")),
+    }
+
+
+def _anthropic_sse(event: str, payload: Dict[str, Any]) -> bytes:
+    data = json.dumps(payload, ensure_ascii=False)
+    return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+
+
+def _iter_openai_sse_payloads(chunk: bytes) -> List[Any]:
+    text = chunk.decode("utf-8", "ignore")
+    payloads: List[Any] = []
+    for event in text.split("\n\n"):
+        data_lines = []
+        for line in event.splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+        if not data_lines:
+            continue
+        raw = "\n".join(data_lines)
+        if raw == "[DONE]":
+            payloads.append("[DONE]")
+            continue
+        try:
+            payloads.append(json.loads(raw))
+        except Exception:
+            continue
+    return payloads
+
+
+def _tool_state(tool_states: Dict[int, Dict[str, Any]], openai_index: int) -> Dict[str, Any]:
+    if openai_index not in tool_states:
+        tool_states[openai_index] = {
+            "block_index": -1,
+            "id": f"toolu_{uuid.uuid4().hex[:24]}",
+            "name": "",
+            "arguments": "",
+            "started": False,
+            "stopped": False,
+        }
+    return tool_states[openai_index]
+
+
+async def _execute_anthropic_stream(
+    req: Dict[str, Any],
+    usage_sink: Optional[Dict[str, int]] = None,
+) -> AsyncGenerator[bytes, None]:
+    message_id = f"msg_{uuid.uuid4().hex}"
+    model = req.get("model") or ""
+    yield _anthropic_sse("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    })
+
+    next_block_index = 0
+    text_block_index = -1
+    text_open = False
+    text_closed = False
+    tool_states: Dict[int, Dict[str, Any]] = {}
+    output_tokens = 0
+    stop_reason = "end_turn"
+
+    async for chunk in _execute_failover_stream(req):
+        for payload in _iter_openai_sse_payloads(chunk):
+            if payload == "[DONE]" or not isinstance(payload, dict):
+                continue
+            for choice in payload.get("choices") or []:
+                delta = choice.get("delta") or {}
+                text = delta.get("content") or ""
+                if text:
+                    if text_block_index < 0:
+                        text_block_index = next_block_index
+                        next_block_index += 1
+                        text_open = True
+                        yield _anthropic_sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": text_block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    elif not text_open and not text_closed:
+                        text_open = True
+                    yield _anthropic_sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": text_block_index,
+                        "delta": {"type": "text_delta", "text": text},
+                    })
+
+                for tool_delta in delta.get("tool_calls") or []:
+                    if not isinstance(tool_delta, dict):
+                        continue
+                    if text_open and not text_closed:
+                        text_closed = True
+                        text_open = False
+                        yield _anthropic_sse("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": text_block_index,
+                        })
+                    openai_index = int(tool_delta.get("index") or 0)
+                    state = _tool_state(tool_states, openai_index)
+                    if tool_delta.get("id"):
+                        state["id"] = tool_delta["id"]
+                    fn = tool_delta.get("function") or {}
+                    if fn.get("name"):
+                        state["name"] = fn["name"]
+                    if state["block_index"] < 0:
+                        state["block_index"] = next_block_index
+                        next_block_index += 1
+                    if not state["started"] and state["name"]:
+                        state["started"] = True
+                        yield _anthropic_sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": state["block_index"],
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": state["id"],
+                                "name": state["name"],
+                                "input": {},
+                            },
+                        })
+                    args = fn.get("arguments") or ""
+                    if args:
+                        state["arguments"] += args
+                        if state["started"]:
+                            yield _anthropic_sse("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": state["block_index"],
+                                "delta": {"type": "input_json_delta", "partial_json": args},
+                            })
+
+                finish = choice.get("finish_reason")
+                if finish:
+                    stop_reason = _openai_finish_to_anthropic(finish)
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                output_tokens = int(usage.get("completion_tokens") or output_tokens)
+                if usage_sink is not None:
+                    usage_sink["total_tokens"] = max(
+                        int(usage_sink.get("total_tokens") or 0),
+                        _usage_total_tokens(usage),
+                    )
+
+    if text_open and not text_closed:
+        text_closed = True
+        yield _anthropic_sse("content_block_stop", {
+            "type": "content_block_stop",
+            "index": text_block_index,
+        })
+
+    for openai_index in sorted(tool_states):
+        state = tool_states[openai_index]
+        if not state["started"]:
+            state["started"] = True
+            name = state["name"] or "tool"
+            yield _anthropic_sse("content_block_start", {
+                "type": "content_block_start",
+                "index": state["block_index"],
+                "content_block": {
+                    "type": "tool_use",
+                    "id": state["id"],
+                    "name": name,
+                    "input": {},
+                },
+            })
+            if state["arguments"]:
+                yield _anthropic_sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": state["block_index"],
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": state["arguments"],
+                    },
+                })
+        if not state["stopped"]:
+            state["stopped"] = True
+            yield _anthropic_sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": state["block_index"],
+            })
+
+    if text_block_index < 0 and not tool_states:
+        yield _anthropic_sse("content_block_start", {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })
+        yield _anthropic_sse("content_block_stop", {
+            "type": "content_block_stop",
+            "index": 0,
+        })
+
+    yield _anthropic_sse("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })
+    yield _anthropic_sse("message_stop", {"type": "message_stop"})
+
+
+# ---------------------------------------------------------------------------
+# Routes - /v1
 # ---------------------------------------------------------------------------
 
 
@@ -680,37 +1511,13 @@ async def health():
 
 
 @app.get("/v1/models")
-async def list_models(authorization: Optional[str] = Header(None)):
-    _check_bridge_auth(authorization)
-    out: List[Dict[str, Any]] = []
-    created = int(time.time())
-    for prov, execs in PROVIDER_EXECUTORS.items():
-        # Only expose models for providers that have at least one slot
-        if POOL.by_provider(prov):
-            out.extend(execs["models"]())
-            out.append({
-                "id": prov,
-                "object": "model",
-                "created": created,
-                "owned_by": "bridge",
-                "name": f"{execs['label']} rotation",
-                "description": "Provider alias: route to this provider and rotate enabled accounts.",
-                "provider": prov,
-                "route_kind": "provider",
-            })
-    for group in _route_groups_payload():
-        out.append({
-            "id": group["name"],
-            "object": "model",
-            "created": created,
-            "owned_by": "bridge",
-            "name": f"Route group: {group['name']}",
-            "description": "Custom model/provider rotation group.",
-            "provider": "bridge",
-            "route_kind": "group",
-            "mode": group["mode"],
-            "items": group["items"],
-        })
+async def list_models(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    auth = _authorize_v1(request, authorization, x_api_key)
+    out = _filter_models_for_key(_all_models_payload(), auth)
     return {"object": "list", "data": out}
 
 
@@ -719,12 +1526,15 @@ async def chat_completions(
     request: Request,
     body: Dict[str, Any] = Body(...),
     authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
 ):
-    _check_bridge_auth(authorization)
+    auth = _authorize_v1(request, authorization, x_api_key, model=str(body.get("model") or SETTINGS.codex_default_model))
     stream = bool(body.get("stream"))
     if stream:
+        metered_body, expose_usage = _chat_body_with_internal_usage(body, auth)
         async def producer():
-            async for chunk in _execute_failover_stream(body):
+            stream_gen = _execute_failover_stream(metered_body)
+            async for chunk in _meter_openai_stream(stream_gen, auth, expose_usage=expose_usage):
                 yield chunk
         gen = sse_with_keepalive(producer, SETTINGS.sse_keepalive_seconds)
         return StreamingResponse(
@@ -732,11 +1542,64 @@ async def chat_completions(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     result = await _execute_failover_complete(body)
+    _record_managed_usage(auth, _usage_total_tokens(result.get("usage")), "")
     return JSONResponse(result)
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    auth = _authorize_v1(request, authorization, x_api_key, model=str(body.get("model") or SETTINGS.anthropic_default_model))
+    chat_req = _anthropic_request_to_openai_chat(body)
+    if chat_req.get("stream"):
+        metered_req, _ = _chat_body_with_internal_usage(chat_req, auth)
+        usage_sink: Dict[str, int] = {}
+        async def producer():
+            async for chunk in _execute_anthropic_stream(metered_req, usage_sink):
+                yield chunk
+            _record_managed_usage(
+                auth,
+                int(usage_sink.get("total_tokens") or 0),
+                "" if usage_sink.get("total_tokens") else "missing_usage",
+            )
+
+        gen = sse_with_keepalive(producer, SETTINGS.sse_keepalive_seconds)
+        return StreamingResponse(
+            gen,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    chat_req["stream"] = False
+    completion = await _execute_failover_complete(chat_req)
+    _record_managed_usage(auth, _usage_total_tokens(completion.get("usage")), "")
+    return JSONResponse(_openai_completion_to_anthropic(chat_req, completion))
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    auth = _authorize_v1(request, authorization, x_api_key, model=str(body.get("model") or SETTINGS.anthropic_default_model))
+    text = _anthropic_system_to_text(body.get("system"))
+    text += "\n" + json.dumps(body.get("messages") or [], ensure_ascii=False)
+    text += "\n" + json.dumps(body.get("tools") or [], ensure_ascii=False)
+    # Claude Code uses this endpoint for budgeting. This local shim gives a
+    # conservative approximation because the real tokenizer is provider-side.
+    _record_managed_usage(auth, 0, "")
+    return {"input_tokens": max(1, len(text) // 3)}
 
 
 @app.post("/v1/audio/transcriptions")
 async def audio_transcriptions(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Form("whisper-1"),
     response_format: str = Form("json"),
@@ -744,8 +1607,9 @@ async def audio_transcriptions(
     prompt: Optional[str] = Form(None),
     stream: Optional[bool] = Form(False),
     authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
 ):
-    _check_bridge_auth(authorization)
+    auth = _authorize_v1(request, authorization, x_api_key, model=model)
     data = await file.read()
     if not data:
         raise HTTPException(400, "Empty audio file")
@@ -759,6 +1623,7 @@ async def audio_transcriptions(
             account=account, hint_prompt=prompt or "",
             language=language, model=model,
         )
+        _record_managed_usage(auth, 0, "")
         await POOL.release(account, success=True)
     except QuotaExhausted as e:
         await POOL.mark_exhausted(account, e.resets_at, e.reason)
@@ -828,6 +1693,7 @@ async def well_known():
             "audio_transcriptions": "/v1/audio/transcriptions",
             "oauth_token": "/v1/oauth/token",
             "accounts": "/api/accounts",
+            "api_keys": "/api/keys",
             "health": "/health",
         },
     }
@@ -876,6 +1742,79 @@ async def api_list_groups(authorization: Optional[str] = Header(None)):
         "groups": _route_groups_payload(),
         "modes": sorted(GROUP_MODES),
     }
+
+
+@app.get("/api/keys")
+async def api_list_keys(
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    _check_bridge_auth(authorization, x_api_key)
+    return {"keys": API_KEYS.list_public()}
+
+
+@app.post("/api/keys")
+async def api_create_key(
+    body: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    _check_bridge_auth(authorization, x_api_key)
+    record, secret = API_KEYS.create(body)
+    return {"key": record, "secret": secret}
+
+
+@app.patch("/api/keys/{key_id}")
+async def api_patch_key(
+    key_id: str,
+    body: Dict[str, Any] = Body(...),
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    _check_bridge_auth(authorization, x_api_key)
+    record = API_KEYS.patch(key_id, body)
+    if record is None:
+        raise HTTPException(404, f"Unknown API key: {key_id}")
+    return {"key": record}
+
+
+@app.post("/api/keys/{key_id}/rotate")
+async def api_rotate_key(
+    key_id: str,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    _check_bridge_auth(authorization, x_api_key)
+    rotated = API_KEYS.rotate(key_id)
+    if rotated is None:
+        raise HTTPException(404, f"Unknown API key: {key_id}")
+    record, secret = rotated
+    return {"key": record, "secret": secret}
+
+
+@app.post("/api/keys/{key_id}/reset-usage")
+async def api_reset_key_usage(
+    key_id: str,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    _check_bridge_auth(authorization, x_api_key)
+    record = API_KEYS.patch(key_id, {"token_used": 0, "status": "active"})
+    if record is None:
+        raise HTTPException(404, f"Unknown API key: {key_id}")
+    return {"key": record}
+
+
+@app.delete("/api/keys/{key_id}")
+async def api_delete_key(
+    key_id: str,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    _check_bridge_auth(authorization, x_api_key)
+    if not API_KEYS.delete(key_id):
+        raise HTTPException(404, f"Unknown API key: {key_id}")
+    return {"ok": True}
 
 
 @app.post("/api/groups")
@@ -1001,7 +1940,11 @@ async def api_refresh(slot_id: str, authorization: Optional[str] = Header(None))
     if acc is None:
         raise HTTPException(404, f"Unknown slot: {slot_id}")
     try:
-        await acc.token_store.get_access_token()
+        refresh_if_needed = getattr(acc.token_store, "refresh_if_needed", None)
+        if callable(refresh_if_needed):
+            await refresh_if_needed(force=True)
+        else:
+            await acc.token_store.get_access_token()
         await POOL.mark_valid(acc)
         return await acc.status()
     except Exception as exc:
@@ -1187,7 +2130,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .pill.grey { background: #39414d; color: #d7dde7; }
     .pill.blue { background: #254f9c; color: #eef4ff; }
     .pill.outline { background: transparent; border: 1px solid #424a55; color: #cbd3df; }
-    .account-tools, .add-form, .route-controls {
+    .account-tools, .add-form, .route-controls, .key-form {
       display: flex;
       align-items: flex-end;
       gap: 10px;
@@ -1208,6 +2151,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       background: #161a1f;
     }
     .account-row:last-child { border-bottom: 0; }
+    .account-row.key-row {
+      grid-template-columns: minmax(180px, 1fr) minmax(110px, .55fr) minmax(150px, .75fr) minmax(210px, 1fr) minmax(280px, 1.15fr);
+    }
     .account-row.header-row {
       color: #aab3bf;
       background: #11151a;
@@ -1359,6 +2305,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .kv:last-child { border-bottom: 0; }
     .usage-list { margin: 8px 0 0; padding-left: 18px; color: #cbd3df; }
     .usage-list li { margin: 5px 0; }
+    .secret-box {
+      display: none;
+      margin-top: 12px;
+      border: 1px solid #4f7d50;
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: #102016;
+      color: #dff7e5;
+      overflow-wrap: anywhere;
+    }
+    select[multiple] { min-height: 120px; min-width: 260px; }
     @media (max-width: 920px) {
       .topbar { align-items: flex-start; flex-direction: column; }
       .toolbar-actions { justify-content: flex-start; }
@@ -1413,6 +2370,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <option value="en">English</option>
         </select>
       </label>
+      <button id="adminKeyButton" class="secondary" onclick="setAdminToken()">Admin key</button>
       <button id="refreshButton" class="secondary" onclick="fetchData()">Refresh</button>
     </div>
   </header>
@@ -1422,6 +2380,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button class="tab-button active" id="tabOverviewButton" onclick="setActiveTab('overview')">Overview</button>
       <button class="tab-button" id="tabAccountsButton" onclick="setActiveTab('accounts')">Accounts</button>
       <button class="tab-button" id="tabGroupsButton" onclick="setActiveTab('groups')">Route groups</button>
+      <button class="tab-button" id="tabKeysButton" onclick="setActiveTab('keys')">API keys</button>
       <button class="tab-button" id="tabSettingsButton" onclick="setActiveTab('settings')">Settings</button>
     </nav>
 
@@ -1526,6 +2485,49 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <h3 id="selectedRouteTitle" style="margin-top:14px">Selected route order</h3>
           <div id="selectedRouteItems" class="route-list" ondragover="allowRouteDrop(event)" ondrop="dropRouteItem(event)"></div>
         </div>
+      </div>
+    </section>
+
+    <section id="tab-keys" class="tab-panel">
+      <div class="panel">
+        <div class="panel-heading">
+          <div>
+            <h2 id="keysTitle">API keys</h2>
+            <div class="muted" id="keysHint">Create limited client keys for /v1 usage.</div>
+          </div>
+        </div>
+        <div class="key-form">
+          <div class="field">
+            <label id="keyNameLabel" for="keyName">Name</label>
+            <input id="keyName" class="wide-input" placeholder="Client name">
+          </div>
+          <div class="field">
+            <label id="keyHoursLabel" for="keyHours">Hours</label>
+            <input id="keyHours" type="number" min="0" placeholder="0 = no expiry">
+          </div>
+          <div class="field">
+            <label id="keyTokenLimitLabel" for="keyTokenLimit">Token limit</label>
+            <input id="keyTokenLimit" type="number" min="0" placeholder="0 = unlimited">
+          </div>
+          <div class="field">
+            <label id="keyNetworkLabel" for="keyNetwork">Network</label>
+            <select id="keyNetwork">
+              <option value="local">Localhost</option>
+              <option value="lan">LAN</option>
+              <option value="internet">Internet</option>
+            </select>
+          </div>
+          <div class="field">
+            <label id="keyModelsLabel" for="keyModels">Allowed models</label>
+            <select id="keyModels" multiple></select>
+          </div>
+          <button id="createKeyButton" onclick="createManagedKey()">Create key</button>
+        </div>
+        <div id="keySecretBox" class="secret-box"></div>
+      </div>
+
+      <div class="panel">
+        <div id="keyList"></div>
       </div>
     </section>
 
@@ -1679,7 +2681,38 @@ INDEX_HTML = r"""<!DOCTYPE html>
         missingProvider: 'missing provider {provider}',
         missingGroup: 'missing group {group}',
         missingModel: 'missing model {model}',
-        selfReference: 'references itself'
+        selfReference: 'references itself',
+        apiKeys: 'API keys',
+        adminKey: 'Admin key',
+        adminKeyPrompt: 'Enter admin BRIDGE_API_KEY for this browser.',
+        keysHint: 'Create limited client keys for /v1 usage.',
+        keyName: 'Name',
+        keyNamePlaceholder: 'Client name',
+        keyHours: 'Hours',
+        keyTokenLimit: 'Token limit',
+        keyNetwork: 'Network',
+        keyModels: 'Allowed models',
+        createKey: 'Create key',
+        keyCreated: 'Copy this key now. It will not be shown again:',
+        keyStatus: 'Status',
+        keyUsage: 'Usage',
+        keyPolicy: 'Policy',
+        keyLastUsed: 'Last used',
+        keyNever: 'never',
+        keyNoExpiry: 'no expiry',
+        keyUnlimited: 'unlimited',
+        keyNetworkLocal: 'Localhost',
+        keyNetworkLan: 'LAN',
+        keyNetworkInternet: 'Internet',
+        keyDisable: 'Disable',
+        keyActivate: 'Activate',
+        keyRotate: 'Rotate',
+        keyResetUsage: 'Reset usage',
+        keyEdit: 'Edit',
+        keyModelsPrompt: 'Allowed models, comma-separated. Use * for all.',
+        keyRotateConfirm: 'Rotate this key? Existing secret will stop working.',
+        keyDeleteConfirm: 'Delete API key {name}?',
+        noKeys: 'No managed API keys yet.'
       },
       vi: {
         title: 'Multi-Provider OAuth Bridge',
@@ -1814,7 +2847,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
     let lastAccountsData = null;
     let lastGroupsData = null;
     let lastModelsData = null;
+    let lastKeysData = null;
     let lastFetchOk = false;
+    let adminToken = localStorage.getItem('bridgeAdminToken') || '';
     let apiKeyProviders = new Set();
     let selectedRouteItems = [];
     let activeGroupName = '';
@@ -1850,9 +2885,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
       setText('languageLabel', t('language'));
       setText('baseUrlLabel', t('baseUrl'));
       setText('refreshButton', t('refresh'));
+      setText('adminKeyButton', t('adminKey'));
       setText('tabOverviewButton', t('overview'));
       setText('tabAccountsButton', t('accounts'));
       setText('tabGroupsButton', t('groups'));
+      setText('tabKeysButton', t('apiKeys'));
       setText('tabSettingsButton', t('settings'));
       setText('overviewTitle', t('overview'));
       setText('alertsTitle', t('attention'));
@@ -1881,6 +2918,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
       setText('availableTagsTitle', t('availableTags'));
       el('routeSearch').placeholder = t('routeSearchPlaceholder');
       setText('selectedRouteTitle', t('selectedRoute'));
+      setText('keysTitle', t('apiKeys'));
+      setText('keysHint', t('keysHint'));
+      setText('keyNameLabel', t('keyName'));
+      el('keyName').placeholder = t('keyNamePlaceholder');
+      setText('keyHoursLabel', t('keyHours'));
+      setText('keyTokenLimitLabel', t('keyTokenLimit'));
+      setText('keyNetworkLabel', t('keyNetwork'));
+      setText('keyModelsLabel', t('keyModels'));
+      setText('createKeyButton', t('createKey'));
       setText('settingsTitle', t('settings'));
       setText('runtimeTitle', t('runtime'));
       setText('settingsBaseUrlLabel', t('baseUrl'));
@@ -1895,7 +2941,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     function setActiveTab(tab) {
       activeTab = tab;
-      ['overview', 'accounts', 'groups', 'settings'].forEach(name => {
+      ['overview', 'accounts', 'groups', 'keys', 'settings'].forEach(name => {
         el('tab-' + name).classList.toggle('active', name === tab);
         el('tab' + name.charAt(0).toUpperCase() + name.slice(1) + 'Button').classList.toggle('active', name === tab);
       });
@@ -1912,8 +2958,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
       setTimeout(() => el('groupName').focus(), 0);
     }
 
+    function authHeaders(extra = {}) {
+      const headers = Object.assign({}, extra);
+      if (adminToken) headers.Authorization = 'Bearer ' + adminToken;
+      return headers;
+    }
+
+    function setAdminToken() {
+      const value = prompt(t('adminKeyPrompt'), adminToken);
+      if (value === null) return;
+      adminToken = value.trim();
+      if (adminToken) localStorage.setItem('bridgeAdminToken', adminToken);
+      else localStorage.removeItem('bridgeAdminToken');
+      fetchData();
+    }
+
     async function fetchJson(url) {
-      const r = await fetch(url);
+      const r = await fetch(url, {headers: authHeaders()});
       if (!r.ok) throw new Error(await r.text());
       return r.json();
     }
@@ -1923,13 +2984,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
       if (refresh) refresh.disabled = true;
       try {
         const accountsData = await fetchJson('/api/accounts');
-        const [groupsData, modelsData] = await Promise.all([
+        const [groupsData, modelsData, keysData] = await Promise.all([
           fetchJson('/api/groups').catch(() => null),
           fetchJson('/v1/models').catch(() => null),
+          fetchJson('/api/keys').catch(() => null),
         ]);
         lastAccountsData = accountsData;
         lastGroupsData = groupsData;
         lastModelsData = modelsData;
+        lastKeysData = keysData;
         lastFetchOk = true;
         renderAll();
       } catch (err) {
@@ -1957,6 +3020,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       renderAccountSection();
       renderGroups();
       renderRouteBuilder();
+      renderKeySection();
       renderSettings();
     }
 
@@ -1976,6 +3040,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
       return (lastModelsData && Array.isArray(lastModelsData.data)) ? lastModelsData.data : [];
     }
 
+    function keyModelOptions() {
+      const options = [['*', '* - all models']];
+      providersCatalog().forEach(p => options.push([p.id, 'provider: ' + p.id]));
+      groupsCatalog().forEach(g => options.push([g.name, 'group: ' + g.name]));
+      exposedModels().forEach(m => options.push([m.id, (m.provider || 'model') + ': ' + m.id]));
+      const seen = new Set();
+      return options.filter(([value]) => {
+        if (seen.has(value)) return false;
+        seen.add(value);
+        return true;
+      });
+    }
+
     function renderToolbar() {
       const status = el('serviceStatus');
       if (status) {
@@ -1993,6 +3070,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const providerOptions = [['all', t('filterAllProviders')]].concat(providers.map(p => [p.id, providerLabel(p)]));
       setSelectOptions(el('accountProviderFilter'), providerOptions, accountProviderFilter, false);
       setSelectOptions(el('routeProviderFilter'), providerOptions, routeProviderFilter, false);
+      setSelectOptions(el('keyNetwork'), [
+        ['local', t('keyNetworkLocal')],
+        ['lan', t('keyNetworkLan')],
+        ['internet', t('keyNetworkInternet')],
+      ], el('keyNetwork').value || 'local', false);
+      setSelectOptions(el('keyModels'), keyModelOptions(), null, false);
       const statusOptions = [
         ['all', t('filterAllStatuses')],
         ['healthy', t('healthy')],
@@ -2131,6 +3214,55 @@ INDEX_HTML = r"""<!DOCTYPE html>
         `<div class="account-row header-row"><div>${t('slot')}</div><div>${t('state')}</div><div>${t('rotation')}</div><div>${t('quotaRate')}</div><div>${t('actions')}</div></div>`
       ].concat(accounts.map(renderAccountRow));
       root.innerHTML = `<div class="account-table">${rows.join('')}</div>`;
+    }
+
+    function renderKeySection() {
+      const root = el('keyList');
+      if (!root) return;
+      const keys = (lastKeysData && lastKeysData.keys) || [];
+      if (!keys.length) {
+        root.innerHTML = `<div class="empty">${t('noKeys')}</div>`;
+        return;
+      }
+      const header = `<div class="account-row key-row header-row"><div>${t('keyName')}</div><div>${t('keyStatus')}</div><div>${t('keyUsage')}</div><div>${t('keyPolicy')}</div><div>${t('actions')}</div></div>`;
+      root.innerHTML = `<div class="account-table">${header}${keys.map(renderKeyRow).join('')}</div>`;
+    }
+
+    function renderKeyRow(k) {
+      const statusClass = {active: 'green', disabled: 'grey', expired: 'red', exhausted: 'amber'}[k.status] || 'grey';
+      const limit = k.token_limit ? k.token_limit : t('keyUnlimited');
+      const used = k.token_used || 0;
+      const expires = k.expires_at ? `${t('expiresIn')} ${formatSecs(k.expires_in || 0)}` : t('keyNoExpiry');
+      const models = (k.allowed_models || []).join(', ');
+      const lastUsed = k.last_used_at ? `${formatAge(k.last_used_at)} ${k.last_used_ip ? '(' + escapeHtml(k.last_used_ip) + ')' : ''}` : t('keyNever');
+      const actionStatus = k.status === 'disabled' ? 'active' : 'disabled';
+      const actionLabel = k.status === 'disabled' ? t('keyActivate') : t('keyDisable');
+      return `<div class="account-row key-row">
+        <div data-label="${escapeHtml(t('keyName'))}">
+          <div class="slot-name">${escapeHtml(k.name || k.id)}</div>
+          <div class="slot-id">${escapeHtml(k.prefix || k.id)}</div>
+          <div class="meta">${escapeHtml(t('keyLastUsed'))}: ${lastUsed}</div>
+        </div>
+        <div data-label="${escapeHtml(t('keyStatus'))}">
+          <span class="pill ${statusClass}">${escapeHtml(k.status)}</span>
+          <div class="meta">${escapeHtml(expires)}</div>
+        </div>
+        <div data-label="${escapeHtml(t('keyUsage'))}">
+          <div>${escapeHtml(String(used))} / ${escapeHtml(String(limit))}</div>
+          <div class="meta">${escapeHtml(k.last_error || '')}</div>
+        </div>
+        <div data-label="${escapeHtml(t('keyPolicy'))}">
+          <div>${escapeHtml(k.network_scope || 'local')}</div>
+          <div class="meta">${escapeHtml(models || '-')}</div>
+        </div>
+        <div data-label="${escapeHtml(t('actions'))}" class="actions">
+          <button class="small secondary" onclick="patchManagedKey('${k.id}', {status: '${actionStatus}'})">${actionLabel}</button>
+          <button class="small secondary" onclick="editManagedKey('${k.id}')">${t('keyEdit')}</button>
+          <button class="small secondary" onclick="resetManagedKeyUsage('${k.id}')">${t('keyResetUsage')}</button>
+          <button class="small secondary" onclick="rotateManagedKey('${k.id}')">${t('keyRotate')}</button>
+          <button class="small danger" onclick="deleteManagedKey('${k.id}')">${t('delete')}</button>
+        </div>
+      </div>`;
     }
 
     function getFilteredAccounts(accounts) {
@@ -2485,11 +3617,105 @@ INDEX_HTML = r"""<!DOCTYPE html>
       return parts.slice(0, 2).join(', ');
     }
 
+    function selectedKeyModels() {
+      const selected = Array.from(el('keyModels').selectedOptions || []).map(o => o.value).filter(Boolean);
+      if (!selected.length || selected.includes('*')) return ['*'];
+      return selected;
+    }
+
+    function showManagedSecret(secret) {
+      const box = el('keySecretBox');
+      if (!box) return;
+      box.style.display = 'block';
+      box.innerHTML = `${escapeHtml(t('keyCreated'))}<br><code>${escapeHtml(secret)}</code>`;
+    }
+
+    async function createManagedKey() {
+      const hours = parseInt(el('keyHours').value || '0');
+      const tokenLimit = parseInt(el('keyTokenLimit').value || '0');
+      const body = {
+        name: el('keyName').value.trim() || 'Client key',
+        duration_hours: Number.isFinite(hours) ? Math.max(0, hours) : 0,
+        token_limit: Number.isFinite(tokenLimit) ? Math.max(0, tokenLimit) : 0,
+        network_scope: el('keyNetwork').value || 'local',
+        allowed_models: selectedKeyModels(),
+      };
+      const r = await fetch('/api/keys', {
+        method: 'POST',
+        headers: authHeaders({'Content-Type': 'application/json'}),
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { alert(t('createFailed') + await r.text()); return; }
+      const data = await r.json();
+      if (data.secret) showManagedSecret(data.secret);
+      el('keyName').value = '';
+      await fetchData();
+    }
+
+    async function patchManagedKey(id, body) {
+      const r = await fetch('/api/keys/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        headers: authHeaders({'Content-Type': 'application/json'}),
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { alert(t('saveFailed') + await r.text()); return; }
+      await fetchData();
+    }
+
+    async function editManagedKey(id) {
+      const key = ((lastKeysData && lastKeysData.keys) || []).find(k => k.id === id);
+      if (!key) return;
+      const name = prompt(t('keyName'), key.name || '');
+      if (name === null) return;
+      const limit = prompt(t('keyTokenLimit'), String(key.token_limit || 0));
+      if (limit === null) return;
+      const models = prompt(t('keyModelsPrompt'), (key.allowed_models || ['*']).join(', '));
+      if (models === null) return;
+      const scope = prompt(t('keyNetwork'), key.network_scope || 'local');
+      if (scope === null) return;
+      await patchManagedKey(id, {
+        name,
+        token_limit: parseInt(limit || '0') || 0,
+        allowed_models: models.split(',').map(x => x.trim()).filter(Boolean),
+        network_scope: scope,
+      });
+    }
+
+    async function rotateManagedKey(id) {
+      if (!confirm(t('keyRotateConfirm'))) return;
+      const r = await fetch('/api/keys/' + encodeURIComponent(id) + '/rotate', {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      if (!r.ok) { alert(t('saveFailed') + await r.text()); return; }
+      const data = await r.json();
+      if (data.secret) showManagedSecret(data.secret);
+      await fetchData();
+    }
+
+    async function resetManagedKeyUsage(id) {
+      await fetch('/api/keys/' + encodeURIComponent(id) + '/reset-usage', {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      await fetchData();
+    }
+
+    async function deleteManagedKey(id) {
+      const key = ((lastKeysData && lastKeysData.keys) || []).find(k => k.id === id);
+      if (!confirm(t('keyDeleteConfirm', {name: key ? (key.name || key.id) : id}))) return;
+      await fetch('/api/keys/' + encodeURIComponent(id), {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
+      await fetchData();
+    }
+
     async function createAccount() {
       const provider = el('newProvider').value;
       const alias = el('newAlias').value;
       const r = await fetch('/api/accounts', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
+        method: 'POST', headers: authHeaders({'Content-Type': 'application/json'}),
         body: JSON.stringify({provider, alias}),
       });
       if (!r.ok) { alert(t('createFailed') + await r.text()); return; }
@@ -2503,7 +3729,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       if (!name) { alert(t('groupNameRequired')); return; }
       if (!selectedRouteItems.length) { alert(t('groupItemsRequired')); return; }
       const r = await fetch('/api/groups', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
+        method: 'POST', headers: authHeaders({'Content-Type': 'application/json'}),
         body: JSON.stringify({name, mode, items: selectedRouteItems}),
       });
       if (!r.ok) { alert(t('saveGroupFailed') + await r.text()); return; }
@@ -2513,7 +3739,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     async function deleteGroup(name) {
       if (!confirm(t('deleteGroupConfirm', {name}))) return;
-      await fetch('/api/groups/' + encodeURIComponent(name), {method: 'DELETE'});
+      await fetch('/api/groups/' + encodeURIComponent(name), {method: 'DELETE', headers: authHeaders()});
       if (activeGroupName === name || el('groupName').value.trim() === name) clearGroupBuilder();
       await fetchData();
     }
@@ -2525,7 +3751,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     async function loginSlot(slot) {
       const popup = window.open('about:blank', '_blank');
-      const r = await fetch('/api/accounts/' + slot + '/login', {method: 'POST'});
+      const r = await fetch('/api/accounts/' + slot + '/login', {method: 'POST', headers: authHeaders()});
       const data = await r.json();
       if (data.auth_url) {
         if (popup) popup.location = data.auth_url;
@@ -2540,7 +3766,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const key = prompt(t('pasteApiKey') + slot);
       if (!key) return;
       const r = await fetch('/api/accounts/' + slot + '/api-key', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
+        method: 'POST', headers: authHeaders({'Content-Type': 'application/json'}),
         body: JSON.stringify({api_key: key}),
       });
       if (!r.ok) { alert(t('saveFailed') + await r.text()); return; }
@@ -2548,25 +3774,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
 
     async function refreshSlot(slot) {
-      await fetch('/api/accounts/' + slot + '/refresh', {method: 'POST'});
+      await fetch('/api/accounts/' + slot + '/refresh', {method: 'POST', headers: authHeaders()});
       await fetchData();
     }
 
     async function logoutSlot(slot) {
       if (!confirm(t('logoutConfirm', {slot}))) return;
-      await fetch('/api/accounts/' + slot + '/logout', {method: 'POST'});
+      await fetch('/api/accounts/' + slot + '/logout', {method: 'POST', headers: authHeaders()});
       await fetchData();
     }
 
     async function deleteSlot(slot) {
       if (!confirm(t('deleteConfirm', {slot}))) return;
-      await fetch('/api/accounts/' + slot, {method: 'DELETE'});
+      await fetch('/api/accounts/' + slot, {method: 'DELETE', headers: authHeaders()});
       await fetchData();
     }
 
     async function toggleEnabled(slot, enabled) {
       await fetch('/api/accounts/' + slot, {
-        method: 'PATCH', headers: {'Content-Type': 'application/json'},
+        method: 'PATCH', headers: authHeaders({'Content-Type': 'application/json'}),
         body: JSON.stringify({enabled}),
       });
       await fetchData();
@@ -2574,7 +3800,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     async function toggleRotation(slot, rotation_enabled) {
       await fetch('/api/accounts/' + slot, {
-        method: 'PATCH', headers: {'Content-Type': 'application/json'},
+        method: 'PATCH', headers: authHeaders({'Content-Type': 'application/json'}),
         body: JSON.stringify({rotation_enabled}),
       });
       await fetchData();

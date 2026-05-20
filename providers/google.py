@@ -36,14 +36,23 @@ from core import (
     get_http_client,
     logger,
     safe_int,
+    sse_comment,
     sse_data,
     sse_done,
 )
 
 PROVIDER = "google"
 
-CLIENT_ID = (os.getenv("GOOGLE_OAUTH_CLIENT_ID") or "").strip()
-CLIENT_SECRET = (os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip()
+CLIENT_ID_ENV_KEYS = (
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "GEMINI_CLI_OAUTH_CLIENT_ID",
+    "GOOGLE_GEMINI_OAUTH_CLIENT_ID",
+)
+CLIENT_SECRET_ENV_KEYS = (
+    "GOOGLE_OAUTH_CLIENT_SECRET",
+    "GEMINI_CLI_OAUTH_CLIENT_SECRET",
+    "GOOGLE_GEMINI_OAUTH_CLIENT_SECRET",
+)
 AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
@@ -56,32 +65,122 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
 REFRESH_SAFETY_WINDOW = 60
+_capacity_wait_env = safe_int(os.getenv("GOOGLE_GEMINI_CAPACITY_WAIT_MAX_SECONDS"))
+CAPACITY_AUTO_WAIT_MAX_SECONDS = max(0, _capacity_wait_env if _capacity_wait_env is not None else 75)
+
+
+_GEMINI_CLI_OAUTH_CLIENT_CACHE: Optional[Tuple[str, str]] = None
+
+
+def _first_env(keys: Tuple[str, ...]) -> str:
+    for key in keys:
+        value = (os.getenv(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _gemini_cli_bundle_dirs() -> List[Path]:
+    dirs: List[Path] = []
+    package_dir = (os.getenv("GEMINI_CLI_PACKAGE_DIR") or "").strip()
+    if package_dir:
+        root = Path(package_dir)
+        dirs.extend([root / "bundle", root])
+
+    appdata = (os.getenv("APPDATA") or "").strip()
+    if appdata:
+        dirs.append(Path(appdata) / "npm" / "node_modules" / "@google" / "gemini-cli" / "bundle")
+
+    home = Path.home()
+    dirs.extend([
+        home / "AppData" / "Roaming" / "npm" / "node_modules" / "@google" / "gemini-cli" / "bundle",
+        home / ".npm-global" / "lib" / "node_modules" / "@google" / "gemini-cli" / "bundle",
+        Path("/usr/local/lib/node_modules/@google/gemini-cli/bundle"),
+        Path("/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle"),
+    ])
+
+    seen: set[str] = set()
+    out: List[Path] = []
+    for d in dirs:
+        key = str(d)
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+def _extract_gemini_cli_oauth_client(path: Path) -> Optional[Tuple[str, str]]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    if "OAUTH_CLIENT_ID" not in text or "OAUTH_CLIENT_SECRET" not in text:
+        return None
+    client_id = re.search(r'OAUTH_CLIENT_ID\s*=\s*["\']([^"\']+)["\']', text)
+    client_secret = re.search(r'OAUTH_CLIENT_SECRET\s*=\s*["\']([^"\']+)["\']', text)
+    if not client_id or not client_secret:
+        return None
+    return client_id.group(1), client_secret.group(1)
+
+
+def _gemini_cli_oauth_client() -> Optional[Tuple[str, str]]:
+    global _GEMINI_CLI_OAUTH_CLIENT_CACHE
+    if _GEMINI_CLI_OAUTH_CLIENT_CACHE:
+        return _GEMINI_CLI_OAUTH_CLIENT_CACHE
+
+    for bundle_dir in _gemini_cli_bundle_dirs():
+        if not bundle_dir.exists():
+            continue
+        for path in bundle_dir.glob("chunk-*.js"):
+            found = _extract_gemini_cli_oauth_client(path)
+            if found:
+                _GEMINI_CLI_OAUTH_CLIENT_CACHE = found
+                logger.info("Using OAuth client from installed Gemini CLI package")
+                return found
+    return None
 
 
 def _oauth_client() -> Tuple[str, str]:
-    if not CLIENT_ID or not CLIENT_SECRET:
+    client_id = _first_env(CLIENT_ID_ENV_KEYS)
+    client_secret = _first_env(CLIENT_SECRET_ENV_KEYS)
+    if not client_id or not client_secret:
+        found = _gemini_cli_oauth_client()
+        if found:
+            client_id = client_id or found[0]
+            client_secret = client_secret or found[1]
+    if not client_id or not client_secret:
         raise UpstreamClientError(
             "Google OAuth client is not configured. Set GOOGLE_OAUTH_CLIENT_ID "
-            "and GOOGLE_OAUTH_CLIENT_SECRET before using Google login.",
+            "and GOOGLE_OAUTH_CLIENT_SECRET, or install Gemini CLI on this machine.",
             status_code=500,
         )
-    return CLIENT_ID, CLIENT_SECRET
+    return client_id, client_secret
 
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 
-DEFAULT_GEMINI_MODEL = "auto-gemini-3"
+DEFAULT_GEMINI_MODEL = "gemini-3auto"
 
 GEMINI_MODEL_CATALOG: List[Dict[str, Any]] = [
+    {"id": "gemini-3auto", "name": "Gemini 3 Auto",
+     "description": "Current working Gemini 3 route that avoids unavailable 3.5 models."},
+    {"id": "auto-gemini-3.5", "name": "Auto Gemini 3.5",
+     "description": "Gemini 3.5 router default."},
     {"id": "auto-gemini-3", "name": "Auto Gemini 3",
      "description": "Gemini CLI router default."},
     {"id": "auto-gemini-2.5", "name": "Auto Gemini 2.5",
      "description": "Gemini CLI 2.5 router default."},
+    {"id": "gemini-3.5-flash", "name": "Gemini 3.5 Flash",
+     "description": "Fast Gemini 3.5 model."},
+    {"id": "gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash Lite",
+     "description": "Low latency Gemini 3.5 Flash Lite model."},
     {"id": "gemini-3-pro-preview", "name": "Gemini 3 Pro Preview",
      "description": "Current Gemini Pro preview model."},
     {"id": "gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro Preview",
      "description": "Gemini Pro preview variant."},
+    {"id": "gemini-3.1-flash-preview", "name": "Gemini 3.1 Flash Preview",
+     "description": "Gemini Flash preview variant."},
     {"id": "gemini-3-flash-preview", "name": "Gemini 3 Flash Preview",
      "description": "Current Gemini Flash preview model."},
     {"id": "gemini-3.1-flash-lite-preview", "name": "Gemini 3.1 Flash Lite Preview",
@@ -97,43 +196,67 @@ GEMINI_MODEL_CATALOG: List[Dict[str, Any]] = [
 MODEL_ALIASES = {
     "gemini": DEFAULT_GEMINI_MODEL,
     "gemini-auto": DEFAULT_GEMINI_MODEL,
+    "gemini3auto": "gemini-3auto",
+    "gemini-3-auto": "gemini-3auto",
+    "gemini-auto-3": "gemini-3auto",
+    "auto-gemini-3-current": "gemini-3auto",
+    "gemini-auto-3.5": "auto-gemini-3.5",
     "gemini-auto-2.5": "auto-gemini-2.5",
     "gemini-pro": "gemini-3-pro-preview",
+    "gemini-3.5": "gemini-3.5-flash",
+    "gemini-3.5-flash-preview": "gemini-3.5-flash",
+    "gemini-3.5-flash-lite-preview": "gemini-3.5-flash-lite",
+    "gemini-3.5-flashlite": "gemini-3.5-flash-lite",
     "gemini-3-pro": "gemini-3-pro-preview",
     "gemini-3.1-pro": "gemini-3.1-pro-preview",
+    "gemini-3.1-flash": "gemini-3.1-flash-preview",
     "gemini-3-flash": "gemini-3-flash-preview",
     "gemini-3.1-flash-lite": "gemini-3.1-flash-lite-preview",
-    "gemini-flash": "gemini-2.5-flash",
+    "gemini-flash": "gemini-3-flash-preview",
     "gemini-flash-lite": "gemini-2.5-flash-lite",
     "gemini-2.5-pro-preview": "gemini-2.5-pro",
 }
 
 MODEL_FALLBACK_CHAINS: Dict[str, List[str]] = {
-    # Mirrors Gemini CLI's policy: try Pro first, then Flash as capacity fallback.
+    # Mirrors Gemini CLI 0.42.x: Gemini 3 auto tries Pro, then Flash as last resort.
+    "gemini-3auto": [
+        "gemini-3-pro-preview",
+        "gemini-3-flash-preview",
+    ],
+    "auto-gemini-3.5": [
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3-flash-preview",
+    ],
     "auto-gemini-3": [
         "gemini-3-pro-preview",
         "gemini-3-flash-preview",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
     ],
     "auto-gemini-2.5": ["gemini-2.5-pro", "gemini-2.5-flash"],
     "gemini-3.1-pro-preview": [
         "gemini-3.1-pro-preview",
-        "gemini-3-pro-preview",
         "gemini-3-flash-preview",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
     ],
     "gemini-3-pro-preview": [
         "gemini-3-pro-preview",
         "gemini-3-flash-preview",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
+    ],
+    "gemini-3.5-flash": [
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3-flash-preview",
+    ],
+    "gemini-3.5-flash-lite": [
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
     ],
     "gemini-3-flash-preview": [
         "gemini-3-flash-preview",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
+    ],
+    "gemini-3.1-flash-preview": [
+        "gemini-3.1-flash-preview",
+        "gemini-3-flash-preview",
     ],
     "gemini-3.1-flash-lite-preview": [
         "gemini-3.1-flash-lite-preview",
@@ -143,15 +266,16 @@ MODEL_FALLBACK_CHAINS: Dict[str, List[str]] = {
     "gemini-2.5-pro": ["gemini-2.5-pro", "gemini-2.5-flash"],
     "gemini-2.5-flash": [
         "gemini-2.5-flash",
-        "gemini-3-flash-preview",
-        "gemini-2.5-flash-lite",
     ],
     "gemini-2.5-flash-lite": [
         "gemini-2.5-flash-lite",
         "gemini-2.5-flash",
-        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
     ],
 }
+
+MODEL_COOLDOWNS: Dict[str, float] = {}
+NOT_FOUND_COOLDOWN_SECONDS = 30 * 60
 
 
 def normalize_model(model: Optional[str], default: Optional[str] = None) -> str:
@@ -163,7 +287,12 @@ def normalize_model(model: Optional[str], default: Optional[str] = None) -> str:
     return MODEL_ALIASES.get(raw.lower(), raw)
 
 
-def _model_candidates(model: str) -> List[str]:
+def _account_cooldown_key(account: Any, model: str) -> str:
+    slot_id = str(getattr(account, "slot_id", "") or "global")
+    return f"{slot_id}:{model}"
+
+
+def _model_chain(model: str) -> List[str]:
     chain = MODEL_FALLBACK_CHAINS.get(model, [model])
     seen: set[str] = set()
     out: List[str] = []
@@ -172,6 +301,101 @@ def _model_candidates(model: str) -> List[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _is_model_cooled_down(model: str, account: Any = None, now: Optional[float] = None) -> bool:
+    until = MODEL_COOLDOWNS.get(_account_cooldown_key(account, model), 0)
+    return bool(until and until > (now or time.time()))
+
+
+def _model_candidates(model: str, account: Any = None) -> List[str]:
+    now = time.time()
+    return [item for item in _model_chain(model) if not _is_model_cooled_down(item, account, now)]
+
+
+def _record_model_unavailable(model: str, exc: "_GoogleModelUnavailable", account: Any = None) -> None:
+    reason = (exc.reason or "").upper()
+    cooldown = 0.0
+    if reason == "NOT_FOUND" or exc.status_code == 404:
+        cooldown = NOT_FOUND_COOLDOWN_SECONDS
+    elif exc.retry_delay:
+        cooldown = max(1.0, float(exc.retry_delay))
+    if cooldown <= 0:
+        return
+    until = time.time() + cooldown
+    key = _account_cooldown_key(account, model)
+    MODEL_COOLDOWNS[key] = max(MODEL_COOLDOWNS.get(key, 0), until)
+    logger.info(
+        "Google model %s cooled down for %ds on %s after %s",
+        model,
+        int(cooldown),
+        str(getattr(account, "slot_id", "") or "global"),
+        reason or exc.status_code,
+    )
+
+
+def _model_cooldown_wait_seconds(requested_model: str, account: Any = None) -> float:
+    now = time.time()
+    waits: List[int] = []
+    for item in _model_chain(requested_model):
+        until = MODEL_COOLDOWNS.get(_account_cooldown_key(account, item), 0)
+        if until <= now:
+            continue
+        wait = int(max(1.0, (until - now) + 0.999))
+        waits.append(wait)
+    return float(min(waits)) if waits else 0.0
+
+
+def _can_auto_wait_capacity(delay: float, waited: float) -> bool:
+    if delay <= 0 or CAPACITY_AUTO_WAIT_MAX_SECONDS <= 0:
+        return False
+    return waited + delay <= CAPACITY_AUTO_WAIT_MAX_SECONDS
+
+
+async def _sleep_capacity_cooldown(requested_model: str, account: Any, delay: float) -> None:
+    logger.info(
+        "Google model route %s is cooling down on %s; waiting %ds before retry",
+        requested_model,
+        str(getattr(account, "slot_id", "") or "global"),
+        int(delay),
+    )
+    await asyncio.sleep(delay)
+
+
+async def _stream_capacity_cooldown(requested_model: str, account: Any, delay: float) -> AsyncGenerator[bytes, None]:
+    logger.info(
+        "Google stream route %s is cooling down on %s; waiting %ds before retry",
+        requested_model,
+        str(getattr(account, "slot_id", "") or "global"),
+        int(delay),
+    )
+    deadline = time.time() + delay
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        yield sse_comment(f"gemini capacity wait {int(remaining + 0.999)}s")
+        await asyncio.sleep(min(max(1, SETTINGS.sse_keepalive_seconds), remaining))
+
+
+def _model_cooldown_error(requested_model: str, account: Any = None) -> UpstreamClientError:
+    now = time.time()
+    parts: List[str] = []
+    waits: List[int] = []
+    for item in _model_chain(requested_model):
+        until = MODEL_COOLDOWNS.get(_account_cooldown_key(account, item), 0)
+        if until <= now:
+            continue
+        wait = int(max(1.0, (until - now) + 0.999))
+        waits.append(wait)
+        parts.append(f"{item}:cooldown {wait}s")
+    wait_text = f" Wait {min(waits)}s before retrying." if waits else ""
+    detail = f" Cooldowns: {', '.join(parts)}." if parts else ""
+    return UpstreamClientError(
+        "Google model capacity/rate limit; all fallback models are cooling down. "
+        f"Requested {requested_model}.{wait_text}{detail}",
+        status_code=429,
+    )
 
 
 def build_models_list() -> List[Dict[str, Any]]:
@@ -218,6 +442,7 @@ class GoogleTokenStore:
                 pass
 
     def status(self) -> Dict[str, Any]:
+        self.import_gemini_cli_credentials()
         data = self.load()
         now = time.time()
         token = data.get("access_token") or ""
@@ -246,6 +471,7 @@ class GoogleTokenStore:
 
     async def get_access_token(self) -> str:
         async with self._lock:
+            self.import_gemini_cli_credentials()
             data = self.load()
             token = data.get("access_token")
             expires_at = float(data.get("expires_at") or 0)
@@ -258,6 +484,32 @@ class GoogleTokenStore:
             data.update(new)
             self.save(data)
             return data["access_token"]
+
+    async def refresh_if_needed(
+        self,
+        min_valid_seconds: int = REFRESH_SAFETY_WINDOW,
+        *,
+        force: bool = False,
+    ) -> bool:
+        async with self._lock:
+            self.import_gemini_cli_credentials()
+            data = self.load()
+            token = data.get("access_token")
+            expires_at = float(data.get("expires_at") or 0)
+            refresh = data.get("refresh_token")
+            now = time.time()
+            if not refresh:
+                if force or not token:
+                    raise AuthRevoked("No Google refresh token")
+                return False
+            if not force and token and expires_at > now + max(0, int(min_valid_seconds)):
+                return False
+            new = await self._refresh(refresh)
+            for key, value in new.items():
+                if value not in ("", 0, 0.0, None) or key in {"access_token", "expires_at"}:
+                    data[key] = value
+            self.save(data)
+            return True
 
     async def _refresh(self, refresh_token: str) -> Dict[str, Any]:
         client = await get_http_client()
@@ -297,6 +549,34 @@ class GoogleTokenStore:
 
     def save_code_assist(self, data: Dict[str, Any]) -> None:
         self.ca_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def import_gemini_cli_credentials(self, *, force: bool = False) -> bool:
+        if not SETTINGS.google_import_gemini_cli_credentials:
+            return False
+        data = _load_gemini_cli_oauth()
+        if not data:
+            return False
+        imported = _saved_payload_from_gemini_cli(data)
+        if not imported.get("access_token") and not imported.get("refresh_token"):
+            return False
+
+        current = self.load()
+        current_expiry = float(current.get("expires_at") or 0)
+        imported_expiry = float(imported.get("expires_at") or 0)
+        if not force and current_expiry and current_expiry >= imported_expiry:
+            if current.get("refresh_token") or not imported.get("refresh_token"):
+                return False
+
+        if not imported.get("refresh_token") and current.get("refresh_token"):
+            imported["refresh_token"] = current["refresh_token"]
+        for key in ("email", "account_id"):
+            if not imported.get(key) and current.get(key):
+                imported[key] = current[key]
+        merged = dict(current)
+        merged.update({k: v for k, v in imported.items() if v not in ("", 0, 0.0)})
+        self.save(merged)
+        logger.info("Imported Gemini CLI OAuth credentials from %s", _gemini_cli_oauth_path())
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +641,54 @@ def build_saved_payload(token_payload: Dict[str, Any], userinfo: Optional[Dict[s
         "expires_at": time.time() + expires_in,
         "email": jwt.get("email") or userinfo.get("email") or "",
         "account_id": jwt.get("sub") or userinfo.get("id") or "",
+    }
+
+
+def _gemini_cli_oauth_path() -> Path:
+    configured = SETTINGS.google_gemini_cli_oauth_creds or _first_env((
+        "GEMINI_CLI_OAUTH_CREDS",
+        "GOOGLE_GEMINI_CLI_OAUTH_CREDS",
+    ))
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".gemini" / "oauth_creds.json"
+
+
+def _expiry_seconds(data: Dict[str, Any]) -> float:
+    raw = data.get("expires_at")
+    if raw is None:
+        raw = data.get("expiry_date")
+    try:
+        value = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value > 10_000_000_000:
+        value = value / 1000.0
+    return value
+
+
+def _load_gemini_cli_oauth() -> Dict[str, Any]:
+    path = _gemini_cli_oauth_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Bad Gemini CLI oauth creds at %s: %s", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _saved_payload_from_gemini_cli(data: Dict[str, Any]) -> Dict[str, Any]:
+    id_token = str(data.get("id_token") or "")
+    jwt = decode_jwt_payload(id_token)
+    return {
+        "access_token": str(data.get("access_token") or ""),
+        "refresh_token": str(data.get("refresh_token") or ""),
+        "id_token": id_token,
+        "expires_at": _expiry_seconds(data),
+        "email": jwt.get("email") or "",
+        "account_id": jwt.get("sub") or "",
     }
 
 
@@ -727,6 +1055,35 @@ def _classify_error(status: int, raw_body: str, method: str) -> Exception:
             status_code=status, resets_at=resets_at,
             reason=reason.lower(), raw_body=raw_body,
         )
+    if status in (400, 404):
+        error = _google_error(raw_body)
+        reason = str(error.get("status") or "MODEL_UNAVAILABLE")
+        message = str(error.get("message") or raw_body[:300])
+        lower = message.lower()
+        if status == 404 and method in {"generateContent", "streamGenerateContent"}:
+            return _GoogleModelUnavailable(
+                f"{method}: {message}",
+                status_code=status,
+                raw_body=raw_body,
+                reason=reason,
+            )
+        if (
+            "model" in lower
+            and any(term in lower for term in (
+                "not found",
+                "not available",
+                "unavailable",
+                "unsupported",
+                "invalid",
+                "unknown",
+            ))
+        ):
+            return _GoogleModelUnavailable(
+                f"{method}: {message}",
+                status_code=status,
+                raw_body=raw_body,
+                reason=reason,
+            )
     if status == 403:
         return UpstreamClientError(
             f"{method} forbidden: {raw_body[:300]}", status_code=status, raw_body=raw_body,
@@ -794,6 +1151,131 @@ def _parse_tool_args(raw: Any) -> Dict[str, Any]:
         return {"arguments": str(raw)}
 
 
+def _schema_ref_target(root: Dict[str, Any], ref: str) -> Optional[Any]:
+    if not ref.startswith("#/"):
+        return None
+    current: Any = root
+    for raw_part in ref[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def _google_schema_type(value: Any) -> Any:
+    if isinstance(value, list):
+        non_null = [v for v in value if str(v).lower() != "null"]
+        return _google_schema_type(non_null[0]) if non_null else None
+    if not isinstance(value, str):
+        return value
+    lower = value.lower()
+    if lower == "integer":
+        return "number"
+    if lower in {"object", "array", "string", "number", "boolean", "null"}:
+        return lower
+    return value
+
+
+def _normalize_google_schema(schema: Any, root: Optional[Dict[str, Any]] = None, seen: Optional[set[str]] = None) -> Dict[str, Any]:
+    """Convert JSON Schema into the smaller schema subset accepted by Code Assist."""
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+    root = root or schema
+    seen = seen or set()
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref not in seen:
+        target = _schema_ref_target(root, ref)
+        if isinstance(target, dict):
+            merged = deepcopy(target)
+            for key, value in schema.items():
+                if key != "$ref":
+                    merged[key] = value
+            seen.add(ref)
+            return _normalize_google_schema(merged, root, seen)
+
+    for choice_key in ("anyOf", "oneOf", "allOf"):
+        choices = schema.get(choice_key)
+        if isinstance(choices, list) and choices:
+            nullable = any(isinstance(c, dict) and str(c.get("type")).lower() == "null" for c in choices)
+            if choice_key == "allOf":
+                merged: Dict[str, Any] = {}
+                for choice in choices:
+                    if isinstance(choice, dict):
+                        merged.update(_normalize_google_schema(choice, root, seen))
+                for key, value in schema.items():
+                    if key not in {"allOf", "$defs", "definitions"}:
+                        merged.setdefault(key, value)
+                if nullable:
+                    merged["nullable"] = True
+                return _normalize_google_schema(merged, root, seen)
+            first = next((c for c in choices if isinstance(c, dict) and str(c.get("type")).lower() != "null"), None)
+            if isinstance(first, dict):
+                base = dict(first)
+                for key, value in schema.items():
+                    if key not in {choice_key, "$defs", "definitions"}:
+                        base.setdefault(key, value)
+                if nullable:
+                    base["nullable"] = True
+                return _normalize_google_schema(base, root, seen)
+
+    out: Dict[str, Any] = {}
+    nullable = False
+    raw_type = schema.get("type")
+    if isinstance(raw_type, list) and any(str(v).lower() == "null" for v in raw_type):
+        nullable = True
+    typ = _google_schema_type(raw_type)
+    if typ and typ != "null":
+        out["type"] = typ
+    if schema.get("description"):
+        out["description"] = str(schema["description"])
+    if schema.get("format"):
+        out["format"] = str(schema["format"])
+    if "enum" in schema and isinstance(schema["enum"], list):
+        enum = [v for v in schema["enum"] if v is not None]
+        if enum:
+            out["enum"] = enum
+        if len(enum) != len(schema["enum"]):
+            nullable = True
+    if "const" in schema:
+        out["enum"] = [schema["const"]]
+    if schema.get("nullable") is True or nullable:
+        out["nullable"] = True
+
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        out["type"] = out.get("type") or "object"
+        cleaned_props: Dict[str, Any] = {}
+        for name, prop_schema in props.items():
+            cleaned_props[str(name)] = _normalize_google_schema(prop_schema, root, set(seen))
+        out["properties"] = cleaned_props
+        required = schema.get("required")
+        if isinstance(required, list):
+            req = [str(x) for x in required if str(x) in cleaned_props]
+            if req:
+                out["required"] = req
+
+    items = schema.get("items")
+    if isinstance(items, dict):
+        out["type"] = out.get("type") or "array"
+        out["items"] = _normalize_google_schema(items, root, set(seen))
+    elif isinstance(items, list) and items:
+        out["type"] = out.get("type") or "array"
+        first_item = next((x for x in items if isinstance(x, dict)), None)
+        if first_item:
+            out["items"] = _normalize_google_schema(first_item, root, set(seen))
+
+    for numeric_key in ("minimum", "maximum", "minItems", "maxItems", "minLength", "maxLength"):
+        if numeric_key in schema:
+            out[numeric_key] = schema[numeric_key]
+
+    if not out:
+        out = {"type": "object", "properties": {}}
+    return out
+
+
 def _messages_to_gemini(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     contents: List[Dict[str, Any]] = []
     system_parts: List[Dict[str, Any]] = []
@@ -839,7 +1321,7 @@ def _convert_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
         if fn.get("description"):
             d["description"] = fn["description"]
         if fn.get("parameters"):
-            d["parameters"] = fn["parameters"]
+            d["parameters"] = _normalize_google_schema(fn["parameters"])
         decl.append(d)
     return [{"functionDeclarations": decl}] if decl else None
 
@@ -871,7 +1353,7 @@ def _gen_config(req: Dict[str, Any]) -> Dict[str, Any]:
             cfg["responseMimeType"] = "application/json"
         schema = rf.get("json_schema")
         if isinstance(schema, dict):
-            cfg["responseJsonSchema"] = schema.get("schema") or schema
+            cfg["responseJsonSchema"] = _normalize_google_schema(schema.get("schema") or schema)
     eb = req.get("extra_body")
     if isinstance(eb, dict):
         ge = eb.get("generationConfig") or eb.get("generation_config")
@@ -1054,21 +1536,42 @@ async def complete_completion(req: Dict[str, Any], account) -> Dict[str, Any]:
     model_failures: List[_GoogleModelUnavailable] = []
     ca_response: Optional[Dict[str, Any]] = None
     model = requested_model
-    for candidate in _model_candidates(requested_model):
-        payload, model = build_request(req, account, model_override=candidate)
-        try:
-            ca_response = await _code_assist_call(account, "generateContent", payload, token)
+    waited_capacity = 0.0
+    while ca_response is None:
+        candidates = _model_candidates(requested_model, account)
+        if not candidates:
+            delay = _model_cooldown_wait_seconds(requested_model, account)
+            if not _can_auto_wait_capacity(delay, waited_capacity):
+                raise _model_cooldown_error(requested_model, account)
+            await _sleep_capacity_cooldown(requested_model, account, delay)
+            waited_capacity += delay
+            continue
+        cycle_failures: List[_GoogleModelUnavailable] = []
+        for candidate in candidates:
+            payload, model = build_request(req, account, model_override=candidate)
+            try:
+                ca_response = await _code_assist_call(account, "generateContent", payload, token)
+                break
+            except _GoogleModelUnavailable as exc:
+                exc.model = candidate
+                _record_model_unavailable(candidate, exc, account)
+                cycle_failures.append(exc)
+                model_failures.append(exc)
+                logger.warning(
+                    "Google model %s unavailable for slot %s (%s%s); trying fallback",
+                    candidate,
+                    getattr(account, "slot_id", "?"),
+                    exc.reason or "RESOURCE_EXHAUSTED",
+                    f", retry={int(exc.retry_delay)}s" if exc.retry_delay else "",
+                )
+        if ca_response is not None:
             break
-        except _GoogleModelUnavailable as exc:
-            exc.model = candidate
-            model_failures.append(exc)
-            logger.warning(
-                "Google model %s unavailable for slot %s (%s%s); trying fallback",
-                candidate,
-                getattr(account, "slot_id", "?"),
-                exc.reason or "RESOURCE_EXHAUSTED",
-                f", retry={int(exc.retry_delay)}s" if exc.retry_delay else "",
-            )
+        delay = _model_cooldown_wait_seconds(requested_model, account)
+        if cycle_failures and _can_auto_wait_capacity(delay, waited_capacity):
+            await _sleep_capacity_cooldown(requested_model, account, delay)
+            waited_capacity += delay
+            continue
+        break
     if ca_response is None:
         raise _model_fallback_error(requested_model, model_failures)
     text, tool_calls, finish = _extract_text_and_tools(ca_response)
@@ -1102,89 +1605,102 @@ async def stream_completion(req: Dict[str, Any], account) -> AsyncGenerator[byte
     client = await get_http_client()
     opened_stream = False
     model = requested_model
-    for candidate in _model_candidates(requested_model):
-        payload, model = build_request(req, account, model_override=candidate)
-        async with client.stream(
-            "POST",
-            _code_assist_url("streamGenerateContent"),
-            params={"alt": "sse"},
-            headers=_google_headers(token, _active_project(account)),
-            json=payload,
-        ) as resp:
-            rl = _extract_rate_limit(resp.headers, candidate)
-            if rl:
-                await POOL.record_rate_limit(account, rl)
-            if resp.status_code >= 400:
-                detail = (await resp.aread()).decode("utf-8", "ignore")
-                rl = _extract_rate_limit(resp.headers, candidate, detail)
+    waited_capacity = 0.0
+    while not opened_stream:
+        candidates = _model_candidates(requested_model, account)
+        if not candidates:
+            delay = _model_cooldown_wait_seconds(requested_model, account)
+            if not _can_auto_wait_capacity(delay, waited_capacity):
+                raise _model_cooldown_error(requested_model, account)
+            async for chunk in _stream_capacity_cooldown(requested_model, account, delay):
+                yield chunk
+            waited_capacity += delay
+            continue
+        cycle_failures: List[_GoogleModelUnavailable] = []
+        for candidate in candidates:
+            payload, model = build_request(req, account, model_override=candidate)
+            async with client.stream(
+                "POST",
+                _code_assist_url("streamGenerateContent"),
+                params={"alt": "sse"},
+                headers=_google_headers(token, _active_project(account)),
+                json=payload,
+            ) as resp:
+                rl = _extract_rate_limit(resp.headers, candidate)
                 if rl:
                     await POOL.record_rate_limit(account, rl)
-                err = _classify_error(resp.status_code, detail, "streamGenerateContent")
-                if isinstance(err, _GoogleModelUnavailable):
-                    err.model = candidate
-                    model_failures.append(err)
-                    logger.warning(
-                        "Google stream model %s unavailable for slot %s (%s%s); trying fallback",
-                        candidate,
-                        getattr(account, "slot_id", "?"),
-                        err.reason or "RESOURCE_EXHAUSTED",
-                        f", retry={int(err.retry_delay)}s" if err.retry_delay else "",
-                    )
-                    continue
-                raise err
+                if resp.status_code >= 400:
+                    detail = (await resp.aread()).decode("utf-8", "ignore")
+                    rl = _extract_rate_limit(resp.headers, candidate, detail)
+                    if rl:
+                        await POOL.record_rate_limit(account, rl)
+                    err = _classify_error(resp.status_code, detail, "streamGenerateContent")
+                    if isinstance(err, _GoogleModelUnavailable):
+                        err.model = candidate
+                        _record_model_unavailable(candidate, err, account)
+                        cycle_failures.append(err)
+                        model_failures.append(err)
+                        logger.warning(
+                            "Google stream model %s unavailable for slot %s (%s%s); trying fallback",
+                            candidate,
+                            getattr(account, "slot_id", "?"),
+                            err.reason or "RESOURCE_EXHAUSTED",
+                            f", retry={int(err.retry_delay)}s" if err.retry_delay else "",
+                        )
+                        continue
+                    raise err
 
-            opened_stream = True
-            buffered: List[str] = []
-            async for line in resp.aiter_lines():
-                if line.startswith("data: "):
-                    buffered.append(line[6:].strip())
-                    continue
-                if line != "" or not buffered:
-                    continue
-                raw = "\n".join(buffered)
-                buffered = []
-                if raw == "[DONE]":
-                    break
-                try:
-                    ca_resp = json.loads(raw)
-                except Exception:
-                    continue
-                if not isinstance(ca_resp, dict):
-                    continue
-                text, tool_calls, finish = _extract_text_and_tools(ca_resp)
-                last_usage = _usage(ca_resp) or last_usage
-                if text:
-                    yield sse_data({
-                        "id": response_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
-                    })
-                for idx, tc in enumerate(tool_calls):
-                    emitted_tools = True
-                    yield sse_data({
-                        "id": response_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0,
-                                     "delta": {"tool_calls": [{**tc, "index": idx}]},
-                                     "finish_reason": None}],
-                    })
-                if finish and finish.upper() not in {"", "STOP"}:
-                    break
+                opened_stream = True
+                buffered: List[str] = []
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: "):
+                        buffered.append(line[6:].strip())
+                        continue
+                    if line != "" or not buffered:
+                        continue
+                    raw = "\n".join(buffered)
+                    buffered = []
+                    if raw == "[DONE]":
+                        break
+                    try:
+                        ca_resp = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(ca_resp, dict):
+                        continue
+                    text, tool_calls, finish = _extract_text_and_tools(ca_resp)
+                    last_usage = _usage(ca_resp) or last_usage
+                    if text:
+                        yield sse_data({
+                            "id": response_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                        })
+                    for idx, tc in enumerate(tool_calls):
+                        emitted_tools = True
+                        yield sse_data({
+                            "id": response_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model,
+                            "choices": [{"index": 0,
+                                         "delta": {"tool_calls": [{**tc, "index": idx}]},
+                                         "finish_reason": None}],
+                        })
+                    if finish and finish.upper() not in {"", "STOP"}:
+                        break
+            if opened_stream:
+                break
+        if opened_stream:
+            break
+        delay = _model_cooldown_wait_seconds(requested_model, account)
+        if cycle_failures and _can_auto_wait_capacity(delay, waited_capacity):
+            async for chunk in _stream_capacity_cooldown(requested_model, account, delay):
+                yield chunk
+            waited_capacity += delay
+            continue
         break
 
     if not opened_stream:
-        logger.warning(
-            "Google streaming unavailable for %s on slot %s; falling back to generateContent",
-            requested_model,
-            getattr(account, "slot_id", "?"),
-        )
-        try:
-            completion = await complete_completion(req, account)
-        except UpstreamClientError:
-            raise _model_fallback_error(requested_model, model_failures)
-        async for chunk in _emit_completion_as_stream(completion, response_id, created, include_usage):
-            yield chunk
-        return
+        raise _model_fallback_error(requested_model, model_failures)
 
     yield sse_data({
         "id": response_id, "object": "chat.completion.chunk",

@@ -29,7 +29,7 @@ import httpx
 # Paths
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 ACCOUNTS_DIR = DATA_DIR / "accounts"
 LOG_FILE = DATA_DIR / "bridge.log"
@@ -97,6 +97,9 @@ class Settings:
     log_max_bytes: int = _env_int("BRIDGE_LOG_MAX_BYTES", 10 * 1024 * 1024)
     log_backup_count: int = _env_int("BRIDGE_LOG_BACKUP_COUNT", 5)
     enable_cors: bool = _env_bool("BRIDGE_ENABLE_CORS", True)
+    trust_proxy_headers: bool = _env_bool("BRIDGE_TRUST_PROXY_HEADERS", False)
+    oauth_auto_refresh: bool = _env_bool("BRIDGE_OAUTH_AUTO_REFRESH", True)
+    oauth_refresh_interval_seconds: int = _env_int("BRIDGE_OAUTH_REFRESH_INTERVAL_SECONDS", 300)
     cross_provider_fallback: list[str] = field(
         default_factory=lambda: _env_list("BRIDGE_CROSS_PROVIDER_FALLBACK", [])
     )
@@ -131,9 +134,12 @@ class Settings:
     codex_rate_limit_warn_percent: float = _env_float(
         "OPENAI_CODEX_RATE_LIMIT_WARN_PERCENT", 15.0
     )
+    codex_refresh_safety_seconds: int = _env_int(
+        "OPENAI_CODEX_REFRESH_SAFETY_SECONDS", 24 * 60 * 60
+    )
 
     # Google specifics
-    google_default_model: str = _env_str("GOOGLE_GEMINI_DEFAULT_MODEL", "auto-gemini-3")
+    google_default_model: str = _env_str("GOOGLE_GEMINI_DEFAULT_MODEL", "gemini-3auto")
     google_code_assist_project: str = _env_str(
         "GOOGLE_CODE_ASSIST_PROJECT", _env_str("GOOGLE_CLOUD_PROJECT", "")
     )
@@ -148,6 +154,13 @@ class Settings:
     )
     google_oauth_prompt: str = _env_str("GOOGLE_OAUTH_PROMPT", "consent")
     google_user_agent: str = _env_str("GOOGLE_GEMINI_USER_AGENT", "google-gemini-cli")
+    google_import_gemini_cli_credentials: bool = _env_bool(
+        "GOOGLE_GEMINI_IMPORT_CLI_CREDS", True
+    )
+    google_gemini_cli_oauth_creds: str = _env_str("GOOGLE_GEMINI_CLI_OAUTH_CREDS", "")
+    google_refresh_safety_seconds: int = _env_int(
+        "GOOGLE_OAUTH_REFRESH_SAFETY_SECONDS", 10 * 60
+    )
 
     # Anthropic specifics
     anthropic_default_model: str = _env_str("ANTHROPIC_DEFAULT_MODEL", "claude-sonnet-4-6")

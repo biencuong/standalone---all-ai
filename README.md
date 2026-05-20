@@ -12,7 +12,7 @@ Mọi client OpenAI-compatible (LangChain, LibreChat, OpenWebUI, Cherry Studio, 
 ## Tính năng nổi bật
 
 - **Multi-account pool**: thêm nhiều account cùng loại (vd 3 account ChatGPT) hoặc khác loại (ChatGPT + Gemini + Claude + DeepSeek) trong 1 bridge.
-- **Auto failover khi 429 / 401**: account hết quota hoặc token hỏng → tự chuyển account/model khác khi route đang bật quay vòng, **transparent** với client.
+- **Auto failover khi 429 / 401**: account hết quota hoặc token hỏng → tự chuyển account/model khác khi có route thay thế, **transparent** với client. Slot chỉ cần `enabled` để được dùng; quay vòng là tuỳ chọn chọn tải.
 - **Auto-route theo model**: client gửi `gpt-5.5` → ChatGPT pool, `gemini-2.5-pro` → Google pool, `claude-sonnet-4-6` → Anthropic pool, `deepseek-v4-flash` → DeepSeek pool. **Không cần restart** khi đổi model.
 - **Route groups**: tạo model alias tuỳ biến từ provider, model cụ thể, hoặc nhóm khác; chọn thứ tự ưu tiên / round-robin / random. Model đầu tiên được thử trước ở chế độ ưu tiên.
 - **Cross-provider fallback** (tuỳ chọn): khi pool chính cạn quota, tự nhảy sang provider khác.
@@ -89,6 +89,12 @@ Khi upgrade từ bản cũ: `data/oauth.json` / `data/google_oauth.json` đượ
 | POST | `/api/accounts/{slot_id}/refresh` | Force refresh token |
 | POST | `/api/accounts/{slot_id}/logout` | Clear token (giữ slot) |
 | GET | `/api/groups` | List route group + model/provider tag |
+| GET | `/api/keys` | List managed client API keys, no plaintext secret |
+| POST | `/api/keys` | Create client key limited by time, tokens, allowed models, and network scope |
+| PATCH | `/api/keys/{id}` | Update status, expiry, token limit, model allowlist, network scope |
+| POST | `/api/keys/{id}/rotate` | Rotate secret; plaintext secret is returned once |
+| POST | `/api/keys/{id}/reset-usage` | Reset token usage and reactivate key |
+| DELETE | `/api/keys/{id}` | Delete client key |
 | POST | `/api/groups` | Lưu route group `{name, mode, items}` |
 | DELETE | `/api/groups/{name}` | Xoá route group |
 | GET | `/` | UI |
@@ -153,6 +159,7 @@ Cứ làm tương tự với provider khác. UI hiển thị tất cả slot tro
 | `BRIDGE_CROSS_PROVIDER_FALLBACK` | (rỗng) | Vd `claude,gemini` — khi provider chính cạn quota, thử provider này |
 | `BRIDGE_SSE_KEEPALIVE` | `15` | Giây emit comment-line giữ stream |
 | `BRIDGE_ENABLE_CORS` | `1` | CORS cho web client |
+| `BRIDGE_TRUST_PROXY_HEADERS` | `0` | Nếu chạy sau reverse proxy tin cậy, dùng `X-Forwarded-For`/`X-Real-IP` để check scope Local/LAN/Internet |
 | `BRIDGE_LOG_MAX_BYTES` | `10485760` | Log rotation |
 
 ### Codex (ChatGPT)
@@ -181,13 +188,14 @@ Cứ làm tương tự với provider khác. UI hiển thị tất cả slot tro
 |---|---|---|
 | `GOOGLE_OAUTH_CLIENT_ID` | (rỗng) | OAuth client id cho Google login |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | (rỗng) | OAuth client secret cho Google login |
-| `GOOGLE_GEMINI_DEFAULT_MODEL` | `auto-gemini-3` | |
+| `GOOGLE_GEMINI_DEFAULT_MODEL` | `gemini-3auto` | |
 | `GOOGLE_CODE_ASSIST_PROJECT` | (rỗng) | GCP project id |
 | `GOOGLE_CODE_ASSIST_IGNORE_SERVER_PROJECT` | `0` | |
 | `GOOGLE_CODE_ASSIST_SKIP_LOAD` | `0` | Skip preflight `loadCodeAssist` |
 | `GOOGLE_CODE_ASSIST_USER_PROJECT_HEADER` | `0` | Gửi `x-goog-user-project` |
 | `GOOGLE_OAUTH_PROMPT` | `consent` | |
 | `GOOGLE_GEMINI_USER_AGENT` | `google-gemini-cli` | |
+| `GOOGLE_GEMINI_CAPACITY_WAIT_MAX_SECONDS` | `75` | Chờ và retry trong request khi Google trả capacity/rate-limit ngắn hạn |
 
 ### Anthropic (Claude)
 
@@ -256,7 +264,28 @@ Khi user gọi `gpt-5.5` và tất cả account ChatGPT đều `usage_limit_reac
 BRIDGE_API_KEY=mysecret python main.py
 ```
 
+`BRIDGE_API_KEY` is the master/admin key for the UI and `/api/*`. If it is set,
+click **Admin key** in the UI and enter the value so browser requests include
+`Authorization: Bearer <key>`.
+
+### Managed client API keys
+
+Use the UI tab **API keys** to create limited client keys for `/v1/*`. Plaintext
+secrets are shown only once at create/rotate time; `data/api_keys.json` stores
+only hashes. Each key can limit time, token quota, allowed models, and network
+scope (`local`, `lan`, `internet`). The request that crosses a token limit is
+allowed to finish; the next request returns 429.
+
+Clients use managed keys with the normal OpenAI header:
+
+```bash
+Authorization: Bearer ak_xxx
+```
+
 Client phải gửi `Authorization: Bearer mysecret` ở mọi request `/v1/*`.
+
+For `/v1/*`, clients may use either the master key or a managed `ak_...` key.
+Managed keys cannot call `/api/*`.
 
 ## Troubleshooting
 
@@ -266,6 +295,8 @@ Client phải gửi `Authorization: Bearer mysecret` ở mọi request `/v1/*`.
 | Account `invalid` | UI → Login lại |
 | Tất cả 429 | Đợi reset (UI hiển thị `429 23s`) hoặc thêm account khác |
 | Claude chưa chạy | UI → slot Claude → API key, hoặc set `ANTHROPIC_API_KEY` |
+| Gemini báo `capacity/rate limit`, quota chưa hết | Bridge cooldown theo account+model, không đổi route sticky; mặc định chờ reset ngắn tối đa 75s rồi retry |
+| Gemini báo `Unknown name "$defs"` / `Unknown name "$ref"` | Bridge tự rút gọn JSON Schema tool/response về subset của Google trước khi gọi Code Assist |
 | Stream cắt giữa | Tự retry 502/503/504. Tăng `BRIDGE_UPSTREAM_RETRIES` nếu cần |
 
 Log: `data/bridge.log` (auto-rotate). Tail trên Windows: `Get-Content data\bridge.log -Wait -Tail 50`.

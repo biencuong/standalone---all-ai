@@ -40,7 +40,7 @@ Lần đầu tự cài `pip install -r requirements.txt`. Sau đó bridge chạy
 4. Claude/DeepSeek: bấm **API key** ở slot vừa tạo rồi dán API key tương ứng
 5. Lặp lại để thêm account khác. **Mẹo**: dùng incognito hoặc browser khác để đăng nhập account ChatGPT thứ hai mà không bị conflict session.
 
-Bridge tự load balance khi có nhiều slot cùng provider, tự failover khi 1 slot bị 429. Mỗi slot có nút bật/tắt **quay vòng**; slot tắt quay vòng vẫn còn trong UI nhưng không được chọn cho request tự động.
+Bridge tự load balance khi có nhiều slot cùng provider, tự failover khi 1 slot bị 429. Slot chỉ cần bật **Enabled** là có thể chạy; **quay vòng** chỉ là tuỳ chọn ưu tiên chọn tải khi dùng pool nhiều account.
 
 ### Nhóm route tuỳ biến
 
